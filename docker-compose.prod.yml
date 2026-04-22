@@ -1,0 +1,48 @@
+# Production compose override — uses pre-built ghcr.io images instead of local builds.
+#
+# Usage (merge with the base compose file):
+#   docker compose \
+#     -f skills/hermes-paperclip-setup/docker/docker-compose.yml \
+#     -f docker-compose.prod.yml \
+#     up -d
+#
+# Images are published by the build-images.yml GitHub Actions workflow on every
+# push to main. Pin to a specific SHA for reproducible deployments:
+#   HERMES_IMAGE_TAG=abc1234 docker compose -f ... -f docker-compose.prod.yml up -d
+
+version: "3.9"
+
+# Image tag to pull — defaults to 'latest', override with IMAGE_TAG env var
+# e.g. IMAGE_TAG=abc1234 docker compose ... up -d
+x-image-tag: &image-tag "${IMAGE_TAG:-latest}"
+
+services:
+
+  paperclip:
+    # Override the local build with the ghcr.io pre-built image
+    build: !reset null
+    image: ghcr.io/${GITHUB_USERNAME}/ai-workforce-paperclip:*image-tag
+    pull_policy: always   # always pull latest on each `up`
+
+  hermes-worker:
+    build: !reset null
+    image: ghcr.io/${GITHUB_USERNAME}/ai-workforce-hermes-worker:*image-tag
+    pull_policy: always
+    environment:
+      # Agent git identity — used when agents commit work to the repo
+      AGENT_GIT_TOKEN:  "${AGENT_GIT_TOKEN:-}"
+      AGENT_GIT_USER:   "${AGENT_GIT_USER:-ai-workforce-bot}"
+      AGENT_GIT_EMAIL:  "${AGENT_GIT_EMAIL:-agents@localhost}"
+      AGENT_REPO_URL:   "${AGENT_REPO_URL:-}"        # e.g. https://github.com/you/ai-workforce
+      AGENT_REPO_BRANCH_PREFIX: "agent"              # branches: agent/<session>/<topic>
+    volumes:
+      # Mount the repo into the container so agents can commit and push
+      - type: bind
+        source: "${AGENT_WORKSPACE_PATH:-.}/workspace"
+        target: /workspace
+        read_only: false
+
+  mcp-server:
+    build: !reset null
+    image: ghcr.io/${GITHUB_USERNAME}/ai-workforce-mcp-server:*image-tag
+    pull_policy: always

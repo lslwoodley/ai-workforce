@@ -1,0 +1,23 @@
+{
+  "version": "1",
+  "non_interactive": true,
+  "sessions_dir": "/hermes/sessions",
+  "skills_dir": "/hermes/skills",
+  "terminal_backend": "local",
+  "tools": {
+    "shell": true,
+    "file_read": true,
+    "file_write": true,
+    "web_search": true,
+    "web_fetch": true,
+    "python": true,
+    "memory": true
+  },
+  "memory": {
+    "enabled": true,
+    "nudge_interval": 5
+  },
+  "gateway": {
+    "enabled": false
+  }
+}

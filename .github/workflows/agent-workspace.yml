@@ -1,0 +1,142 @@
+name: Agent Workspace
+
+# Agents commit their work to workspace/agents/<session-id>/ on branches
+# named agent/<session-id>/<topic>. This workflow:
+#   1. Auto-creates a pull request when an agent pushes a branch
+#   2. Labels it "agent-work" so you can filter in the PR list
+#   3. Posts a summary of files changed by the agent
+#   4. Runs a basic lint/format check on any code the agent produced
+#
+# Human review is always required before merging (enforced via branch protection).
+
+on:
+  push:
+    branches:
+      - "agent/**"    # all agent branches, e.g. agent/ceo-001/market-research
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ── Create or update the pull request for this agent branch ─────────────────
+  open-pr:
+    name: Open agent PR
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pull-request-number }}
+      pr_created: ${{ steps.pr.outputs.pull-request-created }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to compute diff
+
+      - name: Parse branch metadata
+        id: meta
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          # Expected format: agent/<session-id>/<topic>
+          SESSION_ID=$(echo "$BRANCH" | cut -d/ -f2)
+          TOPIC=$(echo "$BRANCH" | cut -d/ -f3- | tr '-' ' ')
+          echo "branch=$BRANCH"     >> $GITHUB_OUTPUT
+          echo "session=$SESSION_ID" >> $GITHUB_OUTPUT
+          echo "topic=$TOPIC"        >> $GITHUB_OUTPUT
+
+      - name: Count changed files
+        id: diff
+        run: |
+          COUNT=$(git diff --name-only origin/main...HEAD | wc -l | tr -d ' ')
+          FILES=$(git diff --name-only origin/main...HEAD | head -20 | sed 's/^/- /' | tr '\n' '\n')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          # Multi-line output needs delimiter
+          {
+            echo 'files<<EOF'
+            git diff --name-only origin/main...HEAD | head -20 | sed 's/^/- /'
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Create or update pull request
+        id: pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.meta.outputs.branch }}
+          base: main
+          title: "[Agent] ${{ steps.meta.outputs.session }}: ${{ steps.meta.outputs.topic }}"
+          body: |
+            ## Agent Work — Human Review Required
+
+            | Field | Value |
+            |-------|-------|
+            | **Agent** | `${{ steps.meta.outputs.session }}` |
+            | **Topic** | ${{ steps.meta.outputs.topic }} |
+            | **Files changed** | ${{ steps.diff.outputs.count }} |
+            | **Branch** | `${{ steps.meta.outputs.branch }}` |
+
+            ### Changed files
+            ${{ steps.diff.outputs.files }}
+
+            ---
+            > This PR was opened automatically when the agent pushed work.
+            > Review the changes and merge or close as appropriate.
+            > The agent cannot merge this PR — that requires a human.
+          labels: agent-work
+          assignees: ${{ github.repository_owner }}
+          draft: false
+
+      - name: Log PR link
+        run: |
+          echo "PR #${{ steps.pr.outputs.pull-request-number }}: ${{ steps.pr.outputs.pull-request-url }}"
+          echo "### Agent PR" >> $GITHUB_STEP_SUMMARY
+          echo "**Agent:** ${{ steps.meta.outputs.session }}" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** ${{ steps.pr.outputs.pull-request-url }}" >> $GITHUB_STEP_SUMMARY
+
+  # ── Light quality check on agent-produced code ───────────────────────────────
+  lint-agent-code:
+    name: Lint agent output
+    runs-on: ubuntu-latest
+    needs: open-pr
+
+    steps:
+      - name: Checkout agent branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Python files (if any)
+        run: |
+          PY_FILES=$(git diff --name-only origin/main...HEAD -- '*.py' 2>/dev/null || true)
+          if [[ -n "$PY_FILES" ]]; then
+            pip install ruff --quiet
+            echo "$PY_FILES" | xargs ruff check --select E,W,F --exit-zero
+            echo "Python lint complete"
+          else
+            echo "No Python files changed — skipping lint"
+          fi
+
+      - name: Check shell scripts (if any)
+        run: |
+          SH_FILES=$(git diff --name-only origin/main...HEAD -- '*.sh' 2>/dev/null || true)
+          if [[ -n "$SH_FILES" ]]; then
+            sudo apt-get install -y shellcheck -qq
+            echo "$SH_FILES" | xargs shellcheck --severity=warning || true
+          else
+            echo "No shell scripts changed — skipping shellcheck"
+          fi
+
+      - name: Post lint results to PR
+        if: needs.open-pr.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: ${{ needs.open-pr.outputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### 🔍 Automated quality check\nLint checks ran on agent-produced files. Review any warnings above before merging.`
+            })

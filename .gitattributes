@@ -1,0 +1,37 @@
+# Force LF line endings for everything that runs on Linux.
+# This prevents Windows git from converting these to CRLF,
+# which would break shell scripts and Dockerfiles inside containers.
+
+# Default: normalise all text files to LF in the repo
+* text=auto eol=lf
+
+# Shell scripts MUST be LF - CRLF will cause "exec format error" in Docker
+*.sh        text eol=lf
+Dockerfile* text eol=lf
+*.dockerfile text eol=lf
+
+# Python
+*.py        text eol=lf
+
+# Windows-native files can keep CRLF
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Markdown, YAML, JSON, TOML - LF everywhere for consistency
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+*.env       text eol=lf
+*.example   text eol=lf
+
+# Binary files - no line ending conversion
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.gz        binary
+*.tar       binary

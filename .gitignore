@@ -1,0 +1,75 @@
+# ── Secrets (NEVER commit these) ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+*_secret*
+*_token*
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Local build artefacts — CI builds to ghcr.io, not local
+docker/paperclip-data/
+docker/hermes-sessions/
+docker/hermes-skills/
+data/
+
+# ── Hermes Agent local data ───────────────────────────────────────────────────
+# Sessions and memory live in Docker volumes, not the repo.
+# Agent *output* (committed deliberately) lives in workspace/agents/
+.hermes/
+hermes-sessions/
+hermes-skills/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ── Node / npm ────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.pnpm-store/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Skill eval workspace (local only) ────────────────────────────────────────
+*-workspace/
+evals/results/

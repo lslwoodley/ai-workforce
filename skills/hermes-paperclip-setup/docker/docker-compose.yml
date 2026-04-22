@@ -1,0 +1,142 @@
+# Hermes + Paperclip AI Workforce — Unified Docker Compose
+#
+# Usage:
+#   cp .env.example .env        # fill in API keys
+#   docker compose up --build -d
+#   open http://localhost:3100   # Paperclip UI
+#
+# Idempotency: safe to run docker compose up -d repeatedly.
+# Data persists in named volumes. Use `docker compose down -v` only for a full reset.
+
+version: "3.9"
+
+# ── Shared network ─────────────────────────────────────────────────────────────
+networks:
+  ai-workforce:
+    driver: bridge
+    # Named explicitly so it survives docker compose down (not down -v)
+    name: ai-workforce
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  paperclip-data:   # Paperclip DB (embedded Postgres), org chart, tasks, agent configs
+  hermes-sessions:  # Per-agent session state, memory, auto-created skills
+  hermes-skills:    # Shared Hermes skills directory (all workers read/write)
+
+# ── Extension fields (YAML anchors for shared config) ─────────────────────────
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# ══════════════════════════════════════════════════════════════════════════════
+services:
+
+  # ── Paperclip: Company OS ────────────────────────────────────────────────────
+  # Built from a local Dockerfile (more reliable than building direct from GitHub URL).
+  # The Dockerfile clones the official repo — pin PAPERCLIP_VERSION to lock to a release.
+  paperclip:
+    <<: [*restart, *logging]
+    build:
+      context: ./paperclip
+      dockerfile: Dockerfile
+      args:
+        PAPERCLIP_VERSION: "${PAPERCLIP_VERSION:-main}"
+    image: ai-workforce/paperclip:${PAPERCLIP_VERSION:-main}
+    container_name: paperclip
+    ports:
+      - "${PAPERCLIP_PORT:-3100}:3100"
+    environment:
+      HOST: "0.0.0.0"
+      PAPERCLIP_HOME: /paperclip
+      ANTHROPIC_API_KEY:  "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY:     "${OPENAI_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      PAPERCLIP_ADMIN_PASSWORD: "${PAPERCLIP_ADMIN_PASSWORD:-changeme}"
+    volumes:
+      - paperclip-data:/paperclip
+    networks:
+      - ai-workforce
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=5", "http://localhost:3100/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 45s   # Paperclip initialises its embedded Postgres on first start
+
+  # ── Hermes Worker: Agent Runtime + Adapter ────────────────────────────────────
+  # Runs the hermes-paperclip-adapter as PID 1.
+  # The adapter polls Paperclip every ADAPTER_HEARTBEAT_INTERVAL seconds,
+  # picks up queued tasks, and invokes `hermes --resume <session> -q "<task>"`.
+  #
+  # Scale workers: docker compose up -d --scale hermes-worker=N
+  hermes-worker:
+    <<: [*restart, *logging]
+    build:
+      context: ./hermes
+      dockerfile: Dockerfile
+    image: ai-workforce/hermes-worker:latest
+    container_name: hermes-worker
+    depends_on:
+      paperclip:
+        condition: service_healthy
+    environment:
+      # Internal Docker DNS — do not use localhost here
+      PAPERCLIP_API_URL:  "http://paperclip:3100"
+      PAPERCLIP_API_KEY:  "${PAPERCLIP_API_KEY:-}"
+      # Model
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      ANTHROPIC_API_KEY:  "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY:     "${OPENAI_API_KEY:-}"
+      HERMES_MODEL:       "${HERMES_MODEL:-openrouter/anthropic/claude-3.5-sonnet}"
+      # Adapter tuning
+      ADAPTER_HEARTBEAT_INTERVAL: "${ADAPTER_HEARTBEAT_INTERVAL:-30}"
+      ADAPTER_MAX_WORKERS:        "${ADAPTER_MAX_WORKERS:-4}"
+      # Data paths inside container (backed by named volumes)
+      HERMES_SESSIONS_DIR: /hermes/sessions
+      HERMES_SKILLS_DIR:   /hermes/skills
+    volumes:
+      - hermes-sessions:/hermes/sessions
+      - hermes-skills:/hermes/skills
+    networks:
+      - ai-workforce
+    # No healthcheck on hermes-worker — it's an adapter process, not a server.
+    # Monitor it via: docker compose logs hermes-worker -f
+
+  # ── MCP Server: Agent-to-Agent Tool API ──────────────────────────────────────
+  # Exposes workforce operations as MCP tools over HTTP (port 8765).
+  # Any MCP-compatible agent can call list_agents, assign_task, query_agent, etc.
+  mcp-server:
+    <<: [*restart, *logging]
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    image: ai-workforce/mcp-server:latest
+    container_name: mcp-server
+    depends_on:
+      paperclip:
+        condition: service_healthy
+    ports:
+      - "${MCP_SERVER_PORT:-8765}:8765"
+    environment:
+      PAPERCLIP_API_URL: "http://paperclip:3100"
+      PAPERCLIP_API_KEY: "${PAPERCLIP_API_KEY:-}"
+      HERMES_SESSIONS_DIR: /hermes/sessions
+      MCP_SERVER_PORT: "8765"
+      MCP_SERVER_HOST: "0.0.0.0"
+    volumes:
+      - hermes-sessions:/hermes/sessions:ro   # read-only — MCP server only reads memory
+    networks:
+      - ai-workforce
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8765/health', timeout=3)"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
