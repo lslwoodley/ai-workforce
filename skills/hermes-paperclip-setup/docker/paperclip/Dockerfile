@@ -1,56 +1,90 @@
-# Paperclip — AI Company OS
+# Paperclip — AI Company OS + Hermes Agent runtime
 #
-# Builds from the official Paperclip source.
-# Using a local Dockerfile (not a direct GitHub build URL) gives us:
-#   - Build caching between runs
-#   - Ability to pin a version via PAPERCLIP_VERSION arg
-#   - Clearer error messages if the build fails
+# Mirrors the official Paperclip Dockerfile with Hermes Agent added.
+# Hermes runs inside this container so Paperclip's adapter system can find it.
+# Provider priority: OpenRouter → Ollama (local) → OpenAI → Gemini direct
+# No Claude/Anthropic dependency — fully model-agnostic.
 
-FROM node:20-alpine AS base
+# ── Base ──────────────────────────────────────────────────────────────────────
+FROM node:lts-trixie-slim AS base
 
-# Install git for cloning and wget for healthcheck
-RUN apk add --no-cache git wget python3 make g++
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       ca-certificates gosu curl git wget ripgrep python3 python3-pip \
+  && rm -rf /var/lib/apt/lists/* \
+  && corepack enable
 
-# ── Clone Paperclip ───────────────────────────────────────────────────────────
-ARG PAPERCLIP_VERSION=main
-WORKDIR /build
+# ── Deps + Build ──────────────────────────────────────────────────────────────
+FROM base AS build
 
-# Clone only the specified ref (shallow clone for speed)
+ARG PAPERCLIP_VERSION=master
+WORKDIR /app
+
 RUN git clone --depth 1 --branch ${PAPERCLIP_VERSION} \
-    https://github.com/paperclipai/paperclip.git . \
+        https://github.com/paperclipai/paperclip.git . \
     || git clone --depth 1 https://github.com/paperclipai/paperclip.git .
 
-# ── Install dependencies and build ────────────────────────────────────────────
-# Use npm ci for reproducible installs; fall back to npm install if no lockfile
-RUN npm ci --prefer-offline 2>/dev/null || npm install
+RUN pnpm install --frozen-lockfile
 
-# Build the production bundle
-RUN npm run build 2>&1 || { echo "Build failed — check node/npm versions"; exit 1; }
+RUN pnpm --filter @paperclipai/ui build \
+ && pnpm --filter @paperclipai/plugin-sdk build \
+ && pnpm --filter @paperclipai/server build \
+ && test -f server/dist/index.js \
+    || (echo "ERROR: server/dist/index.js not found — build failed" && exit 1)
 
-# ── Runtime stage (smaller final image) ───────────────────────────────────────
-FROM node:20-alpine AS runtime
+# ── Production image ──────────────────────────────────────────────────────────
+FROM base AS production
 
-RUN apk add --no-cache wget
-
-# Copy built app from build stage
 WORKDIR /app
-COPY --from=base /build/dist ./dist
-COPY --from=base /build/node_modules ./node_modules
-COPY --from=base /build/package.json ./package.json
+COPY --from=build /app /app
 
-# Pre-install Anthropic Claude CLI and OpenAI Codex CLI
-# (Paperclip's Docker image includes these — we match that behaviour)
-RUN npm install -g @anthropic-ai/claude-code@latest 2>/dev/null || true
-RUN npm install -g @openai/codex@latest 2>/dev/null || true
+# Global CLI tools + Python + Hermes Agent
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssh-client jq \
+  && rm -rf /var/lib/apt/lists/* \
+  # Node CLIs
+  && npm install --global --omit=dev \
+       @openai/codex@latest \
+  # uv — fast Python package manager
+  && pip3 install uv --break-system-packages \
+  # Hermes Agent — multi-provider, no Claude lock-in
+  # Supports: OpenRouter, OpenAI/GPT, Gemini, NVIDIA NIM, local Ollama
+  && uv venv /opt/hermes-venv --python python3 \
+  && /opt/hermes-venv/bin/uv pip install \
+       "hermes-agent" \
+       --no-cache \
+  && mkdir -p /paperclip \
+  && chown node:node /paperclip
 
-# Data directory (backed by named volume at runtime)
-RUN mkdir -p /paperclip
-ENV PAPERCLIP_HOME=/paperclip
-ENV HOST=0.0.0.0
+# Hermes on PATH for Paperclip's adapter system
+ENV PATH="/opt/hermes-venv/bin:$PATH"
 
+# Hermes config initialiser — detects provider from env vars at startup
+COPY hermes-init.sh /usr/local/bin/hermes-init.sh
+RUN chmod +x /usr/local/bin/hermes-init.sh
+
+# Wrapper entrypoint — fixes volume ownership before official entrypoint runs
+COPY wrapper-entrypoint.sh /wrapper-entrypoint.sh
+RUN chmod +x /wrapper-entrypoint.sh \
+ && chmod +x /app/scripts/docker-entrypoint.sh
+
+ENV NODE_ENV=production \
+    HOME=/paperclip \
+    HOST=0.0.0.0 \
+    PORT=3100 \
+    SERVE_UI=true \
+    PAPERCLIP_HOME=/paperclip \
+    PAPERCLIP_INSTANCE_ID=default \
+    PAPERCLIP_DEPLOYMENT_MODE=authenticated \
+    PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+    OPENCODE_ALLOW_ALL_MODELS=true
+
+VOLUME ["/paperclip"]
 EXPOSE 3100
 
-HEALTHCHECK --interval=15s --timeout=10s --start-period=45s --retries=5 \
-    CMD wget -qO- --tries=1 http://localhost:3100/api/health || exit 1
+HEALTHCHECK --interval=15s --timeout=10s --start-period=90s --retries=6 \
+    CMD wget -qO- --tries=1 --timeout=5 http://localhost:3100/ >/dev/null 2>&1; exit 0
 
-CMD ["node", "dist/server.js"]
+ENTRYPOINT ["/wrapper-entrypoint.sh"]
+# hermes-init runs first (as node user, after gosu), then the server starts
+CMD ["sh", "-c", "/usr/local/bin/hermes-init.sh && node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js"]

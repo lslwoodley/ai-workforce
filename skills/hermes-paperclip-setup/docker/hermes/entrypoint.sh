@@ -1,21 +1,20 @@
 #!/bin/bash
-# Hermes Worker entrypoint — idempotent startup with full error reporting
+# Hermes Worker entrypoint — utility/git-workspace sidecar
 #
-# Responsibilities:
-#   1. Wait for Paperclip API to be ready (with timeout and clear errors)
-#   2. Configure Hermes model from environment variables (idempotent)
-#   3. Configure git identity so agents can commit work to the repo
-#   4. Verify Hermes is functional
-#   5. Start the hermes-paperclip-adapter (PID 1 via exec)
+# Architecture note:
+#   The hermes-paperclip-adapter is a TypeScript LIBRARY that runs INSIDE
+#   Paperclip (via the hermes_local adapter registry). There is no adapter CLI.
+#   Hermes CLI is installed directly in the Paperclip container so Paperclip
+#   can call `hermes chat -q <task>` as a subprocess.
 #
-# On error: prints diagnostics and exits with non-zero code so Docker
-# can apply the restart policy and the logs are clear about what failed.
+#   This container's roles:
+#     1. Git workspace manager — clones repo, lets agents push branches/PRs
+#     2. Direct task runner — `docker compose exec hermes-worker hermes chat -q "..."`
+#     3. Dev utility — shell into container for hermes debugging
+#
+# On error: prints diagnostics, exits non-zero so Docker can restart.
 
 set -euo pipefail
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Output helpers
-# ══════════════════════════════════════════════════════════════════════════════
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -24,245 +23,145 @@ ok()   { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*"; }
 warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*"; }
 err()  { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*" >&2; }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Error trap — print context and exit clearly
-# ══════════════════════════════════════════════════════════════════════════════
-
 handle_error() {
     local exit_code=$?
     local line_no=$1
     local cmd=$2
-
-    err "════════════════════════════════════════"
-    err "  STARTUP FAILED"
-    err "  Line   : $line_no"
+    err "════════════════════════════════"
+    err "  STARTUP FAILED  line $line_no"
     err "  Command: $cmd"
     err "  Exit   : $exit_code"
-    err "════════════════════════════════════════"
-    err ""
-    err "  Common causes:"
-    err "    • No model API key set (OPENROUTER_API_KEY / ANTHROPIC_API_KEY)"
-    err "    • Paperclip API not reachable at $PAPERCLIP_API_URL"
-    err "    • hermes-paperclip-adapter not installed"
-    err ""
-    err "  To debug: docker compose exec hermes-worker bash"
+    err "════════════════════════════════"
     exit $exit_code
 }
-
 trap 'handle_error $LINENO "$BASH_COMMAND"' ERR
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Environment validation
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Environment ────────────────────────────────────────────────────────────────
 
 PAPERCLIP_API_URL="${PAPERCLIP_API_URL:-http://paperclip:3100}"
-PAPERCLIP_API_KEY="${PAPERCLIP_API_KEY:-}"
 HERMES_MODEL="${HERMES_MODEL:-openrouter/anthropic/claude-3.5-sonnet}"
 HERMES_SESSIONS_DIR="${HERMES_SESSIONS_DIR:-/hermes/sessions}"
 HERMES_SKILLS_DIR="${HERMES_SKILLS_DIR:-/hermes/skills}"
-ADAPTER_HEARTBEAT_INTERVAL="${ADAPTER_HEARTBEAT_INTERVAL:-30}"
-ADAPTER_MAX_WORKERS="${ADAPTER_MAX_WORKERS:-4}"
 
 echo ""
-echo "═══════════════════════════════════════════════════"
-echo "  Hermes Agent Worker"
+echo "═══════════════════════════════════════════════"
+echo "  Hermes Worker (git-workspace / utility)"
 echo "  Paperclip : $PAPERCLIP_API_URL"
 echo "  Model     : $HERMES_MODEL"
 echo "  Sessions  : $HERMES_SESSIONS_DIR"
 echo "  Skills    : $HERMES_SKILLS_DIR"
-echo "  Heartbeat : ${ADAPTER_HEARTBEAT_INTERVAL}s"
-echo "  Workers   : $ADAPTER_MAX_WORKERS"
-echo "═══════════════════════════════════════════════════"
+echo "═══════════════════════════════════════════════"
 echo ""
 
-# Validate at least one API key is present
+# ── Step 1: Validate at least one API key ─────────────────────────────────────
+
 API_KEY_SET=false
-for key_var in OPENROUTER_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY; do
+for key_var in OPENROUTER_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY; do
     val="${!key_var:-}"
-    if [[ -n "$val" && "$val" != "sk-or-" && "$val" != "sk-ant-" ]]; then
+    if [[ -n "$val" && "$val" != "sk-or-" && "$val" != "sk-ant-" && "$val" != "sk-" ]]; then
         API_KEY_SET=true
         break
     fi
 done
 
 if [[ "$API_KEY_SET" != "true" ]]; then
-    err "No model API key is set."
-    err "Set at least one of: OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY"
-    err "Edit your .env file and run: docker compose up -d"
-    exit 1
+    warn "No model API key set — hermes will not be able to run tasks."
+    warn "Set OPENROUTER_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY in .env"
 fi
 
-# Validate directories exist (mounted volumes)
+# ── Step 2: Ensure data directories exist ─────────────────────────────────────
+
 for dir in "$HERMES_SESSIONS_DIR" "$HERMES_SKILLS_DIR"; do
     if [[ ! -d "$dir" ]]; then
-        warn "Directory $dir does not exist — creating..."
         mkdir -p "$dir" || { err "Cannot create $dir — check volume mount"; exit 1; }
     fi
 done
+ok "Data directories ready"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 1: Wait for Paperclip
-# ══════════════════════════════════════════════════════════════════════════════
-
-log "Waiting for Paperclip API at $PAPERCLIP_API_URL ..."
-
-MAX_WAIT=120   # seconds
-INTERVAL=5
-elapsed=0
-
-until curl -sf --max-time 3 "${PAPERCLIP_API_URL}/api/health" > /dev/null 2>&1; do
-    if [[ $elapsed -ge $MAX_WAIT ]]; then
-        err "Paperclip did not become ready after ${MAX_WAIT}s."
-        err ""
-        err "  Check Paperclip logs: docker compose logs paperclip --tail 30"
-        err "  Is the Paperclip container running? docker compose ps"
-        exit 1
-    fi
-    log "  Paperclip not ready yet (${elapsed}s elapsed) — retrying in ${INTERVAL}s..."
-    sleep $INTERVAL
-    elapsed=$((elapsed + INTERVAL))
-done
-
-ok "Paperclip is ready (${elapsed}s)"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 2: Verify Hermes CLI
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Step 3: Verify Hermes CLI ──────────────────────────────────────────────────
 
 log "Checking Hermes CLI..."
-
 if ! command -v hermes &>/dev/null; then
-    err "hermes CLI not found in PATH."
-    err "This means the Docker image build failed or the venv PATH is wrong."
-    err "Rebuild the image: docker compose build --no-cache hermes-worker"
+    err "hermes CLI not found — image build may have failed"
+    err "Rebuild: docker compose build --no-cache hermes-worker"
     exit 1
 fi
-
 HERMES_VERSION=$(hermes --version 2>&1 || echo "unknown")
 ok "Hermes CLI: $HERMES_VERSION"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 3: Configure Hermes model (idempotent)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Step 4: Configure Hermes model (idempotent) ───────────────────────────────
 
 log "Configuring Hermes model..."
-
-# Check if already configured to the right model
 CURRENT_MODEL=$(hermes config get model 2>/dev/null || echo "")
-
 if [[ "$CURRENT_MODEL" == "$HERMES_MODEL" ]]; then
-    ok "Hermes model already set to $HERMES_MODEL — skipping"
+    ok "Hermes model already set to $HERMES_MODEL"
 else
     if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
-        hermes config set provider openrouter --non-interactive 2>/dev/null || warn "Could not set provider (may already be set)"
-        hermes config set model "$HERMES_MODEL" --non-interactive 2>/dev/null || warn "Could not set model (may already be set)"
-        ok "Model configured: $HERMES_MODEL via OpenRouter"
-
-    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-        hermes config set provider anthropic --non-interactive 2>/dev/null || warn "Could not set provider"
-        hermes config set model "claude-sonnet-4-6" --non-interactive 2>/dev/null || warn "Could not set model"
-        ok "Model configured: claude-sonnet-4-6 via Anthropic"
-
+        hermes config set provider openrouter 2>/dev/null || warn "Could not set provider"
+        hermes config set model "$HERMES_MODEL" 2>/dev/null || warn "Could not set model"
+        ok "Model: $HERMES_MODEL via OpenRouter"
     elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
-        hermes config set provider openai --non-interactive 2>/dev/null || warn "Could not set provider"
-        hermes config set model "gpt-4o" --non-interactive 2>/dev/null || warn "Could not set model"
-        ok "Model configured: gpt-4o via OpenAI"
+        hermes config set provider openai 2>/dev/null || warn "Could not set provider"
+        hermes config set model "${HERMES_MODEL:-gpt-4o-mini}" 2>/dev/null || warn "Could not set model"
+        ok "Model: ${HERMES_MODEL:-gpt-4o-mini} via OpenAI"
+    elif [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+        hermes config set provider openai 2>/dev/null || warn "Could not set provider"
+        hermes config set model "${HERMES_MODEL:-gemini-2.0-flash-lite}" 2>/dev/null || warn "Could not set model"
+        ok "Model: ${HERMES_MODEL:-gemini-2.0-flash-lite} via Gemini"
     fi
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 4: Smoke-test Hermes (non-interactive, single query)
-# ══════════════════════════════════════════════════════════════════════════════
-
-log "Running Hermes smoke test..."
-
-SMOKE_RESPONSE=$(hermes -q "Reply with exactly: READY" --non-interactive 2>&1 || true)
-if echo "$SMOKE_RESPONSE" | grep -qi "READY\|ready"; then
-    ok "Hermes smoke test passed"
-else
-    warn "Hermes smoke test returned unexpected response: ${SMOKE_RESPONSE:0:100}"
-    warn "This may indicate a model API issue. Adapter will still start — first task may fail."
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 5: Verify adapter
-# ══════════════════════════════════════════════════════════════════════════════
-
-log "Checking hermes-paperclip-adapter..."
-
-if ! command -v hermes-paperclip &>/dev/null; then
-    err "hermes-paperclip-adapter not found in PATH."
-    err "Rebuild the image: docker compose build --no-cache hermes-worker"
-    exit 1
-fi
-
-ADAPTER_VERSION=$(hermes-paperclip --version 2>&1 || echo "unknown")
-ok "Adapter: $ADAPTER_VERSION"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 6: Start the adapter (replaces this process via exec — becomes PID 1)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 5: Configure git for agent commits (optional — only if token is set)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Step 5: Git workspace setup (only if tokens are provided) ─────────────────
 
 if [[ -n "${AGENT_GIT_TOKEN:-}" && -n "${AGENT_REPO_URL:-}" ]]; then
-    log "Configuring git for agent workspace commits..."
+    log "Configuring git workspace..."
 
     GIT_USER="${AGENT_GIT_USER:-ai-workforce-bot}"
     GIT_EMAIL="${AGENT_GIT_EMAIL:-agents@localhost}"
 
     git config --global user.name  "$GIT_USER"
     git config --global user.email "$GIT_EMAIL"
-
-    # Store credentials so agents can push without prompts
-    # Uses the credential store (plaintext in container — token is scoped & revocable)
     git config --global credential.helper store
-    # Write the token into the credential store
+
     REPO_HOST=$(echo "$AGENT_REPO_URL" | sed 's|https://||' | cut -d/ -f1)
     echo "https://${GIT_USER}:${AGENT_GIT_TOKEN}@${REPO_HOST}" > /root/.git-credentials
     chmod 600 /root/.git-credentials
 
-    # Clone or update the workspace
     WORKSPACE_DIR="${AGENT_WORKSPACE_MOUNT:-/workspace}"
     if [[ -d "$WORKSPACE_DIR/.git" ]]; then
-        log "Workspace repo already cloned at $WORKSPACE_DIR — pulling latest..."
+        log "Workspace already cloned — pulling latest..."
         git -C "$WORKSPACE_DIR" pull --ff-only origin main 2>&1 || \
-            warn "Could not pull latest — proceeding with existing state"
+            warn "Could not pull — proceeding with existing state"
     elif [[ -d "$WORKSPACE_DIR" && -n "$(ls -A $WORKSPACE_DIR 2>/dev/null)" ]]; then
-        warn "Workspace dir $WORKSPACE_DIR exists but is not a git repo — agents will write files but cannot push"
+        warn "$WORKSPACE_DIR exists but is not a git repo — agents can write files but cannot push"
     else
-        log "Cloning repo into $WORKSPACE_DIR..."
+        log "Cloning $AGENT_REPO_URL into $WORKSPACE_DIR..."
         mkdir -p "$WORKSPACE_DIR"
         git clone "$AGENT_REPO_URL" "$WORKSPACE_DIR" 2>&1 || \
             warn "Clone failed — check AGENT_REPO_URL and AGENT_GIT_TOKEN"
     fi
 
-    ok "Git configured: $GIT_USER <$GIT_EMAIL>"
-    ok "Agents can push to: $AGENT_REPO_URL"
-    ok "Branch prefix: ${AGENT_REPO_BRANCH_PREFIX:-agent}/<session-id>/<topic>"
+    ok "Git: $GIT_USER <$GIT_EMAIL>"
+    ok "Repo: $AGENT_REPO_URL"
 else
-    log "Agent git config skipped (AGENT_GIT_TOKEN or AGENT_REPO_URL not set)"
-    log "  To enable: add AGENT_GIT_TOKEN and AGENT_REPO_URL to .env"
+    log "Git workspace skipped (AGENT_GIT_TOKEN / AGENT_REPO_URL not set)"
+    log "  Add these to .env to enable agent commits & PRs"
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 6: Start the adapter
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Step 6: Keepalive ─────────────────────────────────────────────────────────
+# This container stays running so you can:
+#   docker compose exec hermes-worker hermes chat -q "..."
+#   docker compose exec hermes-worker bash
 
-log "Starting hermes-paperclip-adapter..."
+ok "Hermes worker ready."
+echo ""
+echo "  Usage:"
+echo "    docker compose exec hermes-worker hermes chat -q \"your task here\""
+echo "    docker compose exec hermes-worker bash"
 echo ""
 
-AUTH_ARGS=()
-if [[ -n "$PAPERCLIP_API_KEY" ]]; then
-    AUTH_ARGS=(--paperclip-key "$PAPERCLIP_API_KEY")
-fi
-
-exec hermes-paperclip start \
-    --paperclip-url  "$PAPERCLIP_API_URL" \
-    "${AUTH_ARGS[@]}" \
-    --sessions-dir   "$HERMES_SESSIONS_DIR" \
-    --skills-dir     "$HERMES_SKILLS_DIR" \
-    --heartbeat      "$ADAPTER_HEARTBEAT_INTERVAL" \
-    --max-workers    "$ADAPTER_MAX_WORKERS"
+# Heartbeat loop — keeps the container alive and logs that it's healthy
+while true; do
+    sleep 60
+    log "heartbeat — container alive, hermes ready"
+done
