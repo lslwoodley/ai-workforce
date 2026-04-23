@@ -91,38 +91,50 @@ services:
       retries: 5
       start_period: 90s
 
-  # ── Hermes Worker: Credential pool manager + utility sidecar ─────────────────
-  # Seeds all provider pools, shares Claude Code OAuth from paperclip-data volume,
-  # and stays alive for direct task execution and git workspace management.
+  # ── Hermes Gateway: Full Hermes agent runtime + API server ───────────────────
+  # Runs hermes-agent with gateway mode enabled.
+  # Exposes an OpenAI-compatible API on port 8642:
+  #   POST http://localhost:8642/v1/chat/completions
+  #   GET  http://localhost:8642/v1/models
+  #   GET  http://localhost:8642/health
   #
-  # Run a task: docker compose exec hermes-worker hermes chat -q "your task"
-  # Open shell: docker compose exec hermes-worker bash
-  hermes-worker:
+  # Credential pools: OpenRouter (round_robin) → Anthropic (least_used)
+  #   → OpenAI (fill_first) → Gemini → Ollama
+  #   Fallback: free Nemotron on OpenRouter
+  #
+  # Add messaging tokens in .env to also bridge Telegram, Discord, Slack:
+  #   TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN
+  hermes-gateway:
     <<: [*restart, *logging]
     build:
       context: ./hermes
       dockerfile: Dockerfile
-    image: ai-workforce/hermes-worker:latest
-    container_name: hermes-worker
+    image: ai-workforce/hermes-gateway:latest
+    container_name: hermes-gateway
     depends_on:
       paperclip:
         condition: service_healthy
+    ports:
+      - "${HERMES_GATEWAY_PORT:-8642}:8642"
     environment:
       <<: *credentials
-      PAPERCLIP_API_URL: "http://paperclip:3100"
-      PAPERCLIP_API_KEY: "${PAPERCLIP_API_KEY:-}"
+      API_SERVER_PORT: "8642"
       HERMES_SESSIONS_DIR: /hermes/sessions
       HERMES_SKILLS_DIR:   /hermes/skills
-      # Optional git workspace
-      AGENT_GIT_TOKEN:         "${AGENT_GIT_TOKEN:-}"
-      AGENT_REPO_URL:          "${AGENT_REPO_URL:-}"
-      AGENT_GIT_USER:          "${AGENT_GIT_USER:-ai-workforce-bot}"
-      AGENT_GIT_EMAIL:         "${AGENT_GIT_EMAIL:-agents@localhost}"
-      AGENT_WORKSPACE_MOUNT:   "${AGENT_WORKSPACE_MOUNT:-/workspace}"
+      # Messaging platform tokens (optional — enables Telegram/Discord/Slack bridges)
+      TELEGRAM_BOT_TOKEN:  "${TELEGRAM_BOT_TOKEN:-}"
+      DISCORD_BOT_TOKEN:   "${DISCORD_BOT_TOKEN:-}"
+      SLACK_BOT_TOKEN:     "${SLACK_BOT_TOKEN:-}"
+      # Git workspace
+      AGENT_GIT_TOKEN:       "${AGENT_GIT_TOKEN:-}"
+      AGENT_REPO_URL:        "${AGENT_REPO_URL:-}"
+      AGENT_GIT_USER:        "${AGENT_GIT_USER:-ai-workforce-bot}"
+      AGENT_GIT_EMAIL:       "${AGENT_GIT_EMAIL:-agents@localhost}"
+      AGENT_WORKSPACE_MOUNT: "${AGENT_WORKSPACE_MOUNT:-/workspace}"
     volumes:
       - hermes-sessions:/hermes/sessions
       - hermes-skills:/hermes/skills
-      # Read paperclip-data so entrypoint can share Claude Code OAuth credentials
+      # Share Claude Code OAuth credentials from Paperclip container
       - paperclip-data:/paperclip:ro
     networks:
       - ai-workforce

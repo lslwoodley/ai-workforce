@@ -1,22 +1,12 @@
 #!/bin/bash
-# Hermes Worker entrypoint — credential pools, git workspace, keepalive
+# Hermes Gateway entrypoint
 #
-# Architecture:
-#   hermes-agent (Python) runs here. Paperclip uses Claude Code (its own container).
-#   This container is a utility sidecar:
-#     1. Seeds credential pools from all available env vars
-#     2. Shares Claude Code OAuth from the Paperclip volume (if mounted)
-#     3. Manages the git workspace for agent branch commits
-#     4. Stays alive for: docker compose exec hermes-worker hermes chat -q "..."
-#
-# Pool rotation order (same-provider):
-#   OpenRouter  → round_robin  (multiple OR keys spread evenly)
-#   Anthropic   → least_used   (OAuth via Claude Code + API key)
-#   OpenAI      → fill_first
-#   Google      → round_robin
-#
-# Cross-provider fallback:
-#   If ALL pool keys exhausted → fallback_model (free Nemotron on OpenRouter)
+# 1. Verify hermes CLI is installed
+# 2. Seed credential pools from all available env vars
+# 3. Share Claude Code OAuth from Paperclip volume (if mounted)
+# 4. Apply pool rotation strategies to config.yaml
+# 5. Run smoke test
+# 6. exec hermes gateway start  ← becomes PID 1, serves port 8642
 
 set -euo pipefail
 
@@ -26,180 +16,140 @@ ok()   { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*"; }
 warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*"; }
 err()  { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*" >&2; }
 
-handle_error() {
-    err "STARTUP FAILED at line $1: $2 (exit $?)"
-    exit 1
-}
+handle_error() { err "FAILED at line $1: $2"; exit 1; }
 trap 'handle_error $LINENO "$BASH_COMMAND"' ERR
 
-# ── Environment ────────────────────────────────────────────────────────────────
-HERMES_SESSIONS_DIR="${HERMES_SESSIONS_DIR:-/hermes/sessions}"
-HERMES_SKILLS_DIR="${HERMES_SKILLS_DIR:-/hermes/skills}"
 HERMES_HOME="/root/.hermes"
 CLAUDE_CREDS_DIR="/root/.claude"
 
 echo ""
 echo "════════════════════════════════════════════════"
-echo "  Hermes Worker — credential pool bootstrap"
+echo "  Hermes Gateway"
+echo "  API server : http://0.0.0.0:${API_SERVER_PORT:-8642}"
+echo "  Sessions   : ${HERMES_SESSIONS_DIR:-/hermes/sessions}"
+echo "  Skills     : ${HERMES_SKILLS_DIR:-/hermes/skills}"
 echo "════════════════════════════════════════════════"
 echo ""
 
-# ── Step 1: Verify Hermes CLI ──────────────────────────────────────────────────
+# ── Step 1: Verify hermes ──────────────────────────────────────────────────────
 log "Checking Hermes CLI..."
 if ! command -v hermes &>/dev/null; then
-    err "hermes CLI not found — image build failed"
-    err "Rebuild: docker compose build --no-cache hermes-worker"
+    err "hermes not found — image build failed"
+    err "Rebuild: docker compose build --no-cache hermes-gateway"
     exit 1
 fi
-HERMES_VERSION=$(hermes --version 2>&1 || echo "unknown")
-ok "Hermes: $HERMES_VERSION"
+ok "Hermes: $(hermes --version 2>&1 || echo unknown)"
 
-# ── Step 2: Ensure data directories ───────────────────────────────────────────
-for dir in "$HERMES_SESSIONS_DIR" "$HERMES_SKILLS_DIR" "$HERMES_HOME"; do
+# ── Step 2: Data directories ───────────────────────────────────────────────────
+for dir in "${HERMES_SESSIONS_DIR:-/hermes/sessions}" "${HERMES_SKILLS_DIR:-/hermes/skills}" "$HERMES_HOME"; do
     [[ -d "$dir" ]] || mkdir -p "$dir"
 done
-ok "Directories ready"
 
-# ── Step 3: Merge pool rotation config into config.yaml ───────────────────────
-log "Applying pool rotation strategies..."
+# ── Step 3: Merge pool rotation strategies ─────────────────────────────────────
 POOL_CFG="$HERMES_HOME/pool-config.yaml"
 MAIN_CFG="$HERMES_HOME/config.yaml"
-
-if [[ -f "$POOL_CFG" ]]; then
-    # Append if not already present (idempotent)
-    if ! grep -q "credential_pool_strategies" "$MAIN_CFG" 2>/dev/null; then
-        cat "$POOL_CFG" >> "$MAIN_CFG"
-        ok "Pool strategies written to config.yaml"
-    else
-        ok "Pool strategies already in config.yaml — skipping"
-    fi
+if [[ -f "$POOL_CFG" ]] && ! grep -q "credential_pool_strategies" "$MAIN_CFG" 2>/dev/null; then
+    cat "$POOL_CFG" >> "$MAIN_CFG"
+    ok "Pool rotation strategies applied"
 fi
 
-# ── Step 4: Claude Code OAuth sharing ─────────────────────────────────────────
-# Paperclip stores Claude credentials at /paperclip/.claude/.credentials.json
-# (HOME=/paperclip for the node user). Mount paperclip-data:ro in compose to
-# share them with this container automatically.
-log "Checking for Claude Code OAuth credentials..."
+# ── Step 4: Share Claude Code OAuth from Paperclip volume ─────────────────────
 PAPERCLIP_CREDS="/paperclip/.claude/.credentials.json"
-
 if [[ -f "$PAPERCLIP_CREDS" ]]; then
     mkdir -p "$CLAUDE_CREDS_DIR"
     cp "$PAPERCLIP_CREDS" "$CLAUDE_CREDS_DIR/.credentials.json"
-    ok "Claude Code OAuth shared from Paperclip volume"
-    ok "Hermes will auto-discover Anthropic OAuth from ~/.claude/.credentials.json"
+    ok "Claude Code OAuth shared from Paperclip volume → Anthropic pool"
 else
-    log "No Claude Code credentials at $PAPERCLIP_CREDS"
-    log "  To enable: run 'docker compose exec paperclip claude auth login'"
-    log "  Then restart this container to pick up the credentials"
+    log "No Claude OAuth at $PAPERCLIP_CREDS (run: docker compose exec paperclip claude auth login)"
 fi
 
-# ── Step 5: Seed credential pools from environment variables ──────────────────
+# ── Step 5: Seed credential pools ─────────────────────────────────────────────
 log "Seeding credential pools..."
 
-seed_api_key() {
-    local provider="$1"; local key="$2"; local label="$3"
-    if [[ -n "$key" && "$key" != "sk-or-" && "$key" != "sk-ant-" && "$key" != "sk-" ]]; then
-        hermes auth add "$provider" --type api-key --api-key "$key" --label "$label" \
-            --non-interactive 2>/dev/null \
-            && ok "  Pool [$provider] ← $label" \
-            || warn "  Pool [$provider] ← $label (already exists or error — skipping)"
-    fi
+seed_key() {
+    local provider="$1" key="$2" label="$3"
+    [[ -z "$key" || "$key" == "sk-or-" || "$key" == "sk-ant-" || "$key" == "sk-" ]] && return
+    hermes auth add "$provider" --type api-key --api-key "$key" --label "$label" \
+        --non-interactive 2>/dev/null \
+        && ok "  [$provider] ← $label" \
+        || warn "  [$provider] ← $label (exists/error — skip)"
 }
 
-# OpenRouter — primary pool (free + paid models)
-seed_api_key "openrouter" "${OPENROUTER_API_KEY:-}"   "OPENROUTER_API_KEY"
-seed_api_key "openrouter" "${OPENROUTER_API_KEY_2:-}" "OPENROUTER_API_KEY_2"
-seed_api_key "openrouter" "${OPENROUTER_API_KEY_3:-}" "OPENROUTER_API_KEY_3"
+# OpenRouter — primary (round_robin)
+seed_key "openrouter" "${OPENROUTER_API_KEY:-}"   "OPENROUTER_API_KEY"
+seed_key "openrouter" "${OPENROUTER_API_KEY_2:-}" "OPENROUTER_API_KEY_2"
+seed_key "openrouter" "${OPENROUTER_API_KEY_3:-}" "OPENROUTER_API_KEY_3"
 
-# Anthropic — least_used, pairs with Claude Code OAuth (auto-discovered above)
-seed_api_key "anthropic" "${ANTHROPIC_API_KEY:-}"   "ANTHROPIC_API_KEY"
-seed_api_key "anthropic" "${ANTHROPIC_API_KEY_2:-}" "ANTHROPIC_API_KEY_2"
+# Anthropic — least_used (pairs with Claude Code OAuth above)
+seed_key "anthropic" "${ANTHROPIC_API_KEY:-}"   "ANTHROPIC_API_KEY"
+seed_key "anthropic" "${ANTHROPIC_API_KEY_2:-}" "ANTHROPIC_API_KEY_2"
 
 # OpenAI — fill_first fallback
-seed_api_key "openai" "${OPENAI_API_KEY:-}"   "OPENAI_API_KEY"
-seed_api_key "openai" "${OPENAI_API_KEY_2:-}" "OPENAI_API_KEY_2"
+seed_key "openai" "${OPENAI_API_KEY:-}"   "OPENAI_API_KEY"
+seed_key "openai" "${OPENAI_API_KEY_2:-}" "OPENAI_API_KEY_2"
 
-# Google Gemini — via OpenAI-compatible endpoint (round_robin)
-# Configured as custom provider so hermes uses the right base URL
+# Google Gemini — OpenAI-compatible custom endpoint
 if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
     hermes model --provider openai \
-        --api-key   "$GOOGLE_API_KEY" \
-        --base-url  "https://generativelanguage.googleapis.com/v1beta/openai/" \
-        --model     "${GOOGLE_MODEL:-gemini-2.0-flash-lite}" \
-        --label     "Google Gemini" \
+        --api-key  "$GOOGLE_API_KEY" \
+        --base-url "https://generativelanguage.googleapis.com/v1beta/openai/" \
+        --model    "${GOOGLE_MODEL:-gemini-2.0-flash-lite}" \
+        --label    "Google Gemini" \
         --non-interactive 2>/dev/null \
-        && ok "  Custom provider: Google Gemini" \
-        || warn "  Google Gemini config failed (may already exist)"
-fi
-if [[ -n "${GOOGLE_API_KEY_2:-}" ]]; then
-    hermes auth add "Google Gemini" --type api-key \
-        --api-key "$GOOGLE_API_KEY_2" --label "GOOGLE_API_KEY_2" \
-        --non-interactive 2>/dev/null \
-        && ok "  Pool [Google Gemini] ← GOOGLE_API_KEY_2" \
-        || warn "  Pool [Google Gemini] ← GOOGLE_API_KEY_2 (skipping)"
+        && ok "  Custom: Google Gemini" || warn "  Gemini config failed (may exist)"
+    [[ -n "${GOOGLE_API_KEY_2:-}" ]] && \
+        hermes auth add "Google Gemini" --type api-key \
+            --api-key "$GOOGLE_API_KEY_2" --label "GOOGLE_API_KEY_2" \
+            --non-interactive 2>/dev/null \
+        && ok "  [Google Gemini] ← GOOGLE_API_KEY_2" || true
 fi
 
-# Ollama — local, zero cost
+# Ollama — local LLMs, zero cost
 if [[ -n "${OLLAMA_BASE_URL:-}" ]]; then
     hermes model --provider openai \
-        --api-key   "ollama" \
-        --base-url  "${OLLAMA_BASE_URL}/v1" \
-        --model     "${OLLAMA_MODEL:-llama3.2}" \
-        --label     "Ollama (local)" \
+        --api-key  "ollama" \
+        --base-url "${OLLAMA_BASE_URL}/v1" \
+        --model    "${OLLAMA_MODEL:-llama3.2}" \
+        --label    "Ollama (local)" \
         --non-interactive 2>/dev/null \
-        && ok "  Custom provider: Ollama at ${OLLAMA_BASE_URL}" \
-        || warn "  Ollama config failed (may already exist)"
+        && ok "  Custom: Ollama at ${OLLAMA_BASE_URL}" || warn "  Ollama config failed"
 fi
 
-# ── Step 6: Show pool status ───────────────────────────────────────────────────
 echo ""
 log "Credential pool status:"
-hermes auth list 2>/dev/null || warn "Could not list pools (hermes auth list failed)"
-echo ""
+hermes auth list 2>/dev/null || warn "hermes auth list failed"
 
-# ── Step 7: Smoke test ─────────────────────────────────────────────────────────
-log "Running smoke test..."
+# ── Step 6: Smoke test ─────────────────────────────────────────────────────────
+log "Smoke test..."
 SMOKE=$(hermes chat -q "Reply with exactly: READY" --non-interactive 2>&1 || true)
-if echo "$SMOKE" | grep -qi "READY\|ready"; then
-    ok "Smoke test passed — Hermes is operational"
+if echo "$SMOKE" | grep -qi "READY"; then
+    ok "Smoke test passed"
 else
-    warn "Smoke test unexpected response: ${SMOKE:0:120}"
-    warn "First task may fail — check provider keys"
+    warn "Unexpected smoke response: ${SMOKE:0:120}"
+    warn "Gateway will start — first task may fail"
 fi
 
-# ── Step 8: Git workspace ──────────────────────────────────────────────────────
+# ── Step 7: Git workspace ──────────────────────────────────────────────────────
 if [[ -n "${AGENT_GIT_TOKEN:-}" && -n "${AGENT_REPO_URL:-}" ]]; then
     log "Configuring git workspace..."
-    GIT_USER="${AGENT_GIT_USER:-ai-workforce-bot}"
-    GIT_EMAIL="${AGENT_GIT_EMAIL:-agents@localhost}"
-    git config --global user.name  "$GIT_USER"
-    git config --global user.email "$GIT_EMAIL"
+    git config --global user.name  "${AGENT_GIT_USER:-ai-workforce-bot}"
+    git config --global user.email "${AGENT_GIT_EMAIL:-agents@localhost}"
     git config --global credential.helper store
     REPO_HOST=$(echo "$AGENT_REPO_URL" | sed 's|https://||' | cut -d/ -f1)
-    echo "https://${GIT_USER}:${AGENT_GIT_TOKEN}@${REPO_HOST}" > /root/.git-credentials
+    echo "https://${AGENT_GIT_USER:-ai-workforce-bot}:${AGENT_GIT_TOKEN}@${REPO_HOST}" \
+        > /root/.git-credentials
     chmod 600 /root/.git-credentials
     WORKSPACE_DIR="${AGENT_WORKSPACE_MOUNT:-/workspace}"
     if [[ -d "$WORKSPACE_DIR/.git" ]]; then
-        git -C "$WORKSPACE_DIR" pull --ff-only origin main 2>&1 || warn "Could not pull — proceeding"
+        git -C "$WORKSPACE_DIR" pull --ff-only origin main 2>&1 || warn "Pull failed"
     else
         mkdir -p "$WORKSPACE_DIR"
-        git clone "$AGENT_REPO_URL" "$WORKSPACE_DIR" 2>&1 || warn "Clone failed — check tokens"
+        git clone "$AGENT_REPO_URL" "$WORKSPACE_DIR" 2>&1 || warn "Clone failed"
     fi
-    ok "Git: $GIT_USER <$GIT_EMAIL> → $AGENT_REPO_URL"
-else
-    log "Git workspace skipped (AGENT_GIT_TOKEN / AGENT_REPO_URL not set)"
+    ok "Git ready: ${AGENT_REPO_URL}"
 fi
 
-# ── Keepalive ──────────────────────────────────────────────────────────────────
-ok "Hermes worker ready."
+# ── Step 8: Start gateway (becomes PID 1) ─────────────────────────────────────
+ok "Starting Hermes gateway (api_server on port ${API_SERVER_PORT:-8642})..."
 echo ""
-echo "  To run a task:"
-echo "    docker compose exec hermes-worker hermes chat -q \"your task here\""
-echo "  To open a shell:"
-echo "    docker compose exec hermes-worker bash"
-echo ""
-
-while true; do
-    sleep 60
-    log "heartbeat — pools healthy, hermes ready"
-done
+exec hermes gateway start

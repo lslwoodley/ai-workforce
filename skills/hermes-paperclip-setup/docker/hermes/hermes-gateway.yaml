@@ -1,0 +1,22 @@
+# Hermes gateway platform configuration
+# Written to ~/.hermes/gateway.yaml at build time
+#
+# api_server: OpenAI-compatible HTTP API on port 8642
+#   POST /v1/chat/completions  — run a hermes task, get streaming response
+#   GET  /v1/models            — list available models from credential pools
+#   GET  /health               — liveness probe
+#
+# Add messaging platforms here when you have their tokens:
+#   telegram:
+#     enabled: true
+#     token: "${TELEGRAM_BOT_TOKEN}"
+#   discord:
+#     enabled: true
+#     token: "${DISCORD_BOT_TOKEN}"
+#   slack:
+#     enabled: true
+#     token: "${SLACK_BOT_TOKEN}"
+
+platforms:
+  api_server:
+    enabled: true

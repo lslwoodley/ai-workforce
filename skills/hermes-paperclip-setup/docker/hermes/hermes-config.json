@@ -18,6 +18,6 @@
     "nudge_interval": 5
   },
   "gateway": {
-    "enabled": false
+    "enabled": true
   }
 }
