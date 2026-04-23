@@ -1,0 +1,18 @@
+# Hermes credential pool rotation strategies
+# Merged into ~/.hermes/config.yaml at container startup by entrypoint.sh
+#
+# Strategy reference:
+#   fill_first   — drain key #1 before moving to #2 (default)
+#   round_robin  — spread load evenly across all healthy keys
+#   least_used   — always pick the key with the lowest request count
+#   random       — random selection among healthy keys
+
+credential_pool_strategies:
+  openrouter: round_robin    # spread across all OR keys evenly
+  anthropic: least_used      # protect expensive Anthropic quota
+  openai: fill_first         # use primary GPT key until exhausted
+  google: round_robin        # rotate Gemini keys evenly
+
+# Cross-provider fallback: if ALL keys in the primary pool are exhausted,
+# Hermes falls through to this model before giving up.
+fallback_model: "openrouter/nvidia/nemotron-3-super-120b-a12b:free"

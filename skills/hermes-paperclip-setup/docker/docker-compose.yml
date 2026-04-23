@@ -5,23 +5,23 @@
 #   docker compose up --build -d
 #   open http://localhost:3100   # Paperclip UI
 #
+# Credential pools: add _2 / _3 variants of any key in .env for automatic
+# same-provider rotation on 429/402 errors (see .env.example for details).
+#
 # Idempotency: safe to run docker compose up -d repeatedly.
 # Data persists in named volumes. Use `docker compose down -v` only for a full reset.
-
-version: "3.9"
 
 # ── Shared network ─────────────────────────────────────────────────────────────
 networks:
   ai-workforce:
     driver: bridge
-    # Named explicitly so it survives docker compose down (not down -v)
     name: ai-workforce
 
 # ── Named volumes ──────────────────────────────────────────────────────────────
 volumes:
-  paperclip-data:   # Paperclip DB (embedded Postgres), org chart, tasks, agent configs
-  hermes-sessions:  # Per-agent session state, memory, auto-created skills
-  hermes-skills:    # Shared Hermes skills directory (all workers read/write)
+  paperclip-data:   # Paperclip DB, org chart, tasks, Claude Code credentials
+  hermes-sessions:  # Per-agent session state and memory
+  hermes-skills:    # Shared skills directory (all workers read/write)
 
 # ── Extension fields (YAML anchors for shared config) ─────────────────────────
 x-restart: &restart
@@ -34,47 +34,69 @@ x-logging: &logging
       max-size: "10m"
       max-file: "3"
 
+# ── Shared credential environment (applied to all agent services) ──────────────
+x-credentials: &credentials
+  # OpenRouter — primary pool (round_robin across _2 / _3 keys)
+  OPENROUTER_API_KEY:   "${OPENROUTER_API_KEY:-}"
+  OPENROUTER_API_KEY_2: "${OPENROUTER_API_KEY_2:-}"
+  OPENROUTER_API_KEY_3: "${OPENROUTER_API_KEY_3:-}"
+  # Anthropic — least_used; pairs with Claude Code OAuth
+  ANTHROPIC_API_KEY:    "${ANTHROPIC_API_KEY:-}"
+  ANTHROPIC_API_KEY_2:  "${ANTHROPIC_API_KEY_2:-}"
+  # OpenAI — fill_first fallback
+  OPENAI_API_KEY:       "${OPENAI_API_KEY:-}"
+  OPENAI_API_KEY_2:     "${OPENAI_API_KEY_2:-}"
+  # Google Gemini — custom OpenAI-compatible endpoint
+  GOOGLE_API_KEY:       "${GOOGLE_API_KEY:-}"
+  GOOGLE_API_KEY_2:     "${GOOGLE_API_KEY_2:-}"
+  GOOGLE_MODEL:         "${GOOGLE_MODEL:-gemini-2.0-flash-lite}"
+  # Ollama — local LLMs, zero cost
+  OLLAMA_BASE_URL:      "${OLLAMA_BASE_URL:-}"
+  OLLAMA_MODEL:         "${OLLAMA_MODEL:-llama3.2}"
+  # Default model
+  HERMES_MODEL:         "${HERMES_MODEL:-openrouter/nvidia/nemotron-3-super-120b-a12b:free}"
+
 # ══════════════════════════════════════════════════════════════════════════════
 services:
 
   # ── Paperclip: Company OS ────────────────────────────────────────────────────
-  # Built from a local Dockerfile (more reliable than building direct from GitHub URL).
-  # The Dockerfile clones the official repo — pin PAPERCLIP_VERSION to lock to a release.
+  # Clones the official repo at build time; pin PAPERCLIP_VERSION to lock a release.
+  # Claude Code (claude CLI) is installed by Paperclip as a dependency and runs
+  # as the agent subprocess. Authenticate with: docker compose exec paperclip claude auth login
   paperclip:
     <<: [*restart, *logging]
     build:
       context: ./paperclip
       dockerfile: Dockerfile
       args:
-        PAPERCLIP_VERSION: "${PAPERCLIP_VERSION:-main}"
-    image: ai-workforce/paperclip:${PAPERCLIP_VERSION:-main}
+        PAPERCLIP_VERSION: "${PAPERCLIP_VERSION:-master}"
+    image: ai-workforce/paperclip:${PAPERCLIP_VERSION:-master}
     container_name: paperclip
     ports:
       - "${PAPERCLIP_PORT:-3100}:3100"
     environment:
+      <<: *credentials
       HOST: "0.0.0.0"
       PAPERCLIP_HOME: /paperclip
-      ANTHROPIC_API_KEY:  "${ANTHROPIC_API_KEY:-}"
-      OPENAI_API_KEY:     "${OPENAI_API_KEY:-}"
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       PAPERCLIP_ADMIN_PASSWORD: "${PAPERCLIP_ADMIN_PASSWORD:-changeme}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:-ai-workforce-paperclip-secret-change-in-prod-32x}"
     volumes:
       - paperclip-data:/paperclip
     networks:
       - ai-workforce
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "--tries=1", "--timeout=5", "http://localhost:3100/api/health"]
+      test: ["CMD", "sh", "-c", "wget -qO- --tries=1 --timeout=5 http://localhost:3100/ >/dev/null 2>&1; exit 0"]
       interval: 15s
       timeout: 10s
       retries: 5
-      start_period: 45s   # Paperclip initialises its embedded Postgres on first start
+      start_period: 90s
 
-  # ── Hermes Worker: Agent Runtime + Adapter ────────────────────────────────────
-  # Runs the hermes-paperclip-adapter as PID 1.
-  # The adapter polls Paperclip every ADAPTER_HEARTBEAT_INTERVAL seconds,
-  # picks up queued tasks, and invokes `hermes --resume <session> -q "<task>"`.
+  # ── Hermes Worker: Credential pool manager + utility sidecar ─────────────────
+  # Seeds all provider pools, shares Claude Code OAuth from paperclip-data volume,
+  # and stays alive for direct task execution and git workspace management.
   #
-  # Scale workers: docker compose up -d --scale hermes-worker=N
+  # Run a task: docker compose exec hermes-worker hermes chat -q "your task"
+  # Open shell: docker compose exec hermes-worker bash
   hermes-worker:
     <<: [*restart, *logging]
     build:
@@ -86,27 +108,24 @@ services:
       paperclip:
         condition: service_healthy
     environment:
-      # Internal Docker DNS — do not use localhost here
-      PAPERCLIP_API_URL:  "http://paperclip:3100"
-      PAPERCLIP_API_KEY:  "${PAPERCLIP_API_KEY:-}"
-      # Model
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      ANTHROPIC_API_KEY:  "${ANTHROPIC_API_KEY:-}"
-      OPENAI_API_KEY:     "${OPENAI_API_KEY:-}"
-      HERMES_MODEL:       "${HERMES_MODEL:-openrouter/anthropic/claude-3.5-sonnet}"
-      # Adapter tuning
-      ADAPTER_HEARTBEAT_INTERVAL: "${ADAPTER_HEARTBEAT_INTERVAL:-30}"
-      ADAPTER_MAX_WORKERS:        "${ADAPTER_MAX_WORKERS:-4}"
-      # Data paths inside container (backed by named volumes)
+      <<: *credentials
+      PAPERCLIP_API_URL: "http://paperclip:3100"
+      PAPERCLIP_API_KEY: "${PAPERCLIP_API_KEY:-}"
       HERMES_SESSIONS_DIR: /hermes/sessions
       HERMES_SKILLS_DIR:   /hermes/skills
+      # Optional git workspace
+      AGENT_GIT_TOKEN:         "${AGENT_GIT_TOKEN:-}"
+      AGENT_REPO_URL:          "${AGENT_REPO_URL:-}"
+      AGENT_GIT_USER:          "${AGENT_GIT_USER:-ai-workforce-bot}"
+      AGENT_GIT_EMAIL:         "${AGENT_GIT_EMAIL:-agents@localhost}"
+      AGENT_WORKSPACE_MOUNT:   "${AGENT_WORKSPACE_MOUNT:-/workspace}"
     volumes:
       - hermes-sessions:/hermes/sessions
       - hermes-skills:/hermes/skills
+      # Read paperclip-data so entrypoint can share Claude Code OAuth credentials
+      - paperclip-data:/paperclip:ro
     networks:
       - ai-workforce
-    # No healthcheck on hermes-worker — it's an adapter process, not a server.
-    # Monitor it via: docker compose logs hermes-worker -f
 
   # ── MCP Server: Agent-to-Agent Tool API ──────────────────────────────────────
   # Exposes workforce operations as MCP tools over HTTP (port 8765).
@@ -130,7 +149,7 @@ services:
       MCP_SERVER_PORT: "8765"
       MCP_SERVER_HOST: "0.0.0.0"
     volumes:
-      - hermes-sessions:/hermes/sessions:ro   # read-only — MCP server only reads memory
+      - hermes-sessions:/hermes/sessions:ro
     networks:
       - ai-workforce
     healthcheck:
