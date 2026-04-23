@@ -38,26 +38,14 @@ FROM base AS production
 WORKDIR /app
 COPY --from=build /app /app
 
-# Global CLI tools + Python + Hermes Agent
+# Hermes Agent — installed to system Python so Paperclip's adapter can find it
+# Supports: OpenRouter, OpenAI/GPT, Gemini, NVIDIA NIM, local Ollama
 RUN apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
-  # Node CLIs
-  && npm install --global --omit=dev \
-       @openai/codex@latest \
-  # uv — fast Python package manager
-  && pip3 install uv --break-system-packages \
-  # Hermes Agent — multi-provider, no Claude lock-in
-  # Supports: OpenRouter, OpenAI/GPT, Gemini, NVIDIA NIM, local Ollama
-  && uv venv /opt/hermes-venv --python python3 \
-  && /opt/hermes-venv/bin/uv pip install \
-       "hermes-agent" \
-       --no-cache \
+  && pip3 install hermes-agent --break-system-packages \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
-
-# Hermes on PATH for Paperclip's adapter system
-ENV PATH="/opt/hermes-venv/bin:$PATH"
 
 # Hermes config initialiser — detects provider from env vars at startup
 COPY hermes-init.sh /usr/local/bin/hermes-init.sh
