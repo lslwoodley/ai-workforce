@@ -15,4 +15,6 @@ credential_pool_strategies:
 
 # Cross-provider fallback: if ALL keys in the primary pool are exhausted,
 # Hermes falls through to this model before giving up.
-fallback_model: "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+fallback_model:
+  provider: openrouter
+  model: "nvidia/nemotron-3-super-120b-a12b:free"

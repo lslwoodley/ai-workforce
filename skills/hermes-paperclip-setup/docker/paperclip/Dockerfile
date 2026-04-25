@@ -38,20 +38,14 @@ FROM base AS production
 WORKDIR /app
 COPY --from=build /app /app
 
-# Hermes Agent — installed from GitHub source into a venv
-# (hermes-agent is not on PyPI; pip3 on node:trixie-slim puts uv in /root/.local/bin)
+# Hermes Agent — pip install direct from GitHub (no uv needed, no PyPI dependency)
 RUN apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
-  && pip3 install uv --break-system-packages \
-  && git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /opt/hermes-src \
-  && /root/.local/bin/uv venv /opt/hermes-venv --python python3 \
-  && /opt/hermes-venv/bin/uv pip install -e "/opt/hermes-src" --no-cache \
+  && pip3 install "git+https://github.com/NousResearch/hermes-agent.git" \
+       --break-system-packages --no-cache-dir \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
-
-# Hermes binary on PATH for Paperclip's hermes_local adapter
-ENV PATH="/opt/hermes-venv/bin:$PATH"
 
 # Hermes config initialiser — detects provider from env vars at startup
 COPY hermes-init.sh /usr/local/bin/hermes-init.sh

@@ -45,6 +45,12 @@ for dir in "${HERMES_SESSIONS_DIR:-/hermes/sessions}" "${HERMES_SKILLS_DIR:-/her
     [[ -d "$dir" ]] || mkdir -p "$dir"
 done
 
+# Write gateway .env — open access so API server accepts all requests
+HERMES_ENV="$HERMES_HOME/.env"
+grep -q "GATEWAY_ALLOW_ALL_USERS" "$HERMES_ENV" 2>/dev/null \
+    || echo "GATEWAY_ALLOW_ALL_USERS=true" >> "$HERMES_ENV"
+ok "Gateway access: open (GATEWAY_ALLOW_ALL_USERS=true)"
+
 # ── Step 3: Merge pool rotation strategies ─────────────────────────────────────
 POOL_CFG="$HERMES_HOME/pool-config.yaml"
 MAIN_CFG="$HERMES_HOME/config.yaml"
@@ -121,7 +127,7 @@ hermes auth list 2>/dev/null || warn "hermes auth list failed"
 
 # ── Step 6: Smoke test ─────────────────────────────────────────────────────────
 log "Smoke test..."
-SMOKE=$(hermes chat -q "Reply with exactly: READY" --non-interactive 2>&1 || true)
+SMOKE=$(hermes -q "Reply with exactly: READY" 2>&1 || true)
 if echo "$SMOKE" | grep -qi "READY"; then
     ok "Smoke test passed"
 else
@@ -152,4 +158,4 @@ fi
 # ── Step 8: Start gateway (becomes PID 1) ─────────────────────────────────────
 ok "Starting Hermes gateway (api_server on port ${API_SERVER_PORT:-8642})..."
 echo ""
-exec hermes gateway start
+exec hermes gateway run

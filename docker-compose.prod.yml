@@ -10,7 +10,7 @@
 # push to main. Pin to a specific SHA for reproducible deployments:
 #   HERMES_IMAGE_TAG=abc1234 docker compose -f ... -f docker-compose.prod.yml up -d
 
-version: "3.9"
+
 
 # Image tag to pull — defaults to 'latest', override with IMAGE_TAG env var
 # e.g. IMAGE_TAG=abc1234 docker compose ... up -d

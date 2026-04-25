@@ -330,7 +330,7 @@ foreach ($key in @("OPENROUTER_API_KEY","ANTHROPIC_API_KEY","OPENAI_API_KEY")) {
 }
 if (-not $keyFound) {
     Write-Warn "No model API key found. Agents will fail to execute tasks."
-    $script:StepLog += "[WARN] No model API key — add one to $EnvFile"
+    $script:StepLog += "[WARN] No model API key - add one to $EnvFile"
 }
 
 # Load .env values
