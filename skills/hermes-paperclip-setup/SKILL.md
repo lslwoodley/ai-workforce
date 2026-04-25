@@ -1,224 +1,309 @@
 ---
 name: hermes-paperclip-setup
-description: Step-by-step installation and setup of the Hermes Agent + Paperclip AI workforce stack running as Docker containers. Use this skill whenever the user wants to install, configure, or troubleshoot the stack on Windows (via Docker Desktop) or Ubuntu. Covers Docker prerequisites, environment configuration, first-run verification, and platform-specific gotchas. Also invoke when a user asks how to get the stack running, why containers won't start, or how to reset/rebuild the environment.
+description: Step-by-step installation and setup of the Hermes Agent + Paperclip AI workforce stack running as Docker containers. Use this skill whenever the user wants to install, configure, or troubleshoot the stack on Windows (via Docker Desktop) or Ubuntu. Covers Docker prerequisites, environment configuration, first-run verification, credential pools, and all known gotchas discovered in production. Also invoke when a user asks how to get the stack running, why containers won't start, or how to reset/rebuild the environment.
 ---
 
 # Hermes + Paperclip — Docker Setup Skill
 
-This skill installs and verifies the full AI workforce stack as Docker containers, on either a **Windows host** (Docker Desktop + WSL2) or an **Ubuntu host** (Docker Engine). The containers are Linux in both cases — the host OS only affects the Docker installation method.
+This skill installs and verifies the full AI workforce stack as Docker containers on either a **Windows host** (Docker Desktop + WSL2) or an **Ubuntu host** (Docker Engine).
 
-## Stack overview
+---
+
+## Architecture
+
+### How the pieces fit together
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Paperclip  (port 3100)                                 │
+│  ─ Company OS: UI, org chart, task queue, Postgres      │
+│  ─ hermes_local adapter → calls `hermes` CLI subprocess │
+│  ─ hermes-agent installed INSIDE this container         │
+└──────────────────────┬──────────────────────────────────┘
+                       │ agent task dispatch
+┌──────────────────────▼──────────────────────────────────┐
+│  hermes-gateway  (port 8642)                            │
+│  ─ Standalone Hermes API server (OpenAI-compatible)     │
+│  ─ POST /v1/chat/completions                            │
+│  ─ GET  /v1/models                                      │
+│  ─ GET  /health                                         │
+│  ─ Credential pools: OpenRouter → Anthropic → OpenAI    │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│  mcp-server  (port 8765)                                │
+│  ─ Agent-to-agent tool API (FastMCP)                   │
+│  ─ list_agents, assign_task, query_agent, etc.          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Critical architectural facts:**
+- `hermes-agent` is pip-installed **inside the Paperclip container** so the `hermes_local` adapter can call it as a subprocess. It is NOT on PyPI — install from GitHub source.
+- The `hermes-gateway` container is a **separate** standalone Hermes instance with the OpenAI-compatible API server. Paperclip does not use it directly; it's for external API access and direct integrations.
+- There is **no separate hermes-paperclip-adapter CLI** to install or run. The adapter is a TypeScript library bundled inside Paperclip's pnpm install.
+
+### Container summary
 
 | Container | Image | Port | Purpose |
 |-----------|-------|------|---------|
-| `paperclip` | built from source | 3100 | Company OS — UI, API, embedded Postgres, task queue |
-| `hermes-worker` | custom (Python 3.11 + Node 20) | — | Hermes Agent runtime + hermes-paperclip-adapter |
-| `mcp-server` | custom (Python 3.11) | 8765 | MCP server for agent-to-agent tool calls |
-
-Paperclip includes **embedded PostgreSQL** — no separate database container needed.
-
-> **Windows note:** Hermes does not run natively on Windows. It runs inside a Linux container via Docker Desktop's WSL2 backend. This is fully transparent — you manage everything from PowerShell or Windows Terminal.
+| `paperclip` | built from source (node:lts-trixie-slim) | 3100 | Company OS + embedded hermes-agent |
+| `hermes-gateway` | custom (python:3.11-slim) | 8642 | Standalone Hermes API server + credential pools |
+| `mcp-server` | custom (Python) | 8765 | MCP tool server for agent-to-agent calls |
 
 ---
 
-## Step 0: Detect your platform and start
+## Step 0: Prerequisites
 
-Ask yourself:
-- Am I on **Windows 10/11**? → follow the Windows path (read `references/windows.md`)
-- Am I on **Ubuntu 20.04+**? → follow the Ubuntu path (read `references/ubuntu.md`)
+**Windows:**
+- Docker Desktop 4.x+ with WSL2 backend enabled
+- Windows Terminal or PowerShell 7+
+- `&&` does not work as a command separator in Windows PowerShell — use `;` or two separate commands
 
-Read the relevant reference file now for platform-specific details, then return here for the shared steps.
+**Ubuntu:**
+- Docker Engine + Docker Compose plugin (`docker compose`, not `docker-compose`)
+- User in the `docker` group: `sudo usermod -aG docker $USER`
 
 ---
 
-## Step 1: Clone and configure
+## Step 1: Get the files
 
-```bash
-# From your chosen working directory:
-git clone https://github.com/paperclipai/paperclip.git
-git clone https://github.com/nousresearch/hermes-agent.git
-git clone https://github.com/nousresearch/hermes-paperclip-adapter.git
-```
+```powershell
+# Navigate to the docker folder inside this skill
+cd "skills\hermes-paperclip-setup\docker"
 
-Copy our unified compose file and Dockerfiles into place:
-
-```bash
-# Copy the contents of this skill's docker/ folder into the paperclip repo
-cp -r <skill-path>/docker/* paperclip/docker/workforce/
-```
-
-Then copy `.env.example` from this skill to `paperclip/docker/workforce/.env` and fill it in:
-
-```bash
-cp <skill-path>/.env.example paperclip/docker/workforce/.env
+# Copy the example env and fill it in
+cp .env.example .env
 ```
 
 **Required values in `.env`:**
 
 ```dotenv
-# At least one model provider key — OpenRouter gives access to 200+ models
+# At least one — OpenRouter gives 200+ models including free tiers
 OPENROUTER_API_KEY=sk-or-...
 
-# Or Anthropic directly:
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Paperclip admin password (you choose this)
+# Paperclip admin password (you choose)
 PAPERCLIP_ADMIN_PASSWORD=changeme
+
+# Auth secret — must be 32+ characters
+BETTER_AUTH_SECRET=some-random-string-at-least-32-chars-long
+
+# For private repo workspace cloning (GitHub fine-grained PAT, repo contents write)
+AGENT_GIT_TOKEN=github_pat_...
+AGENT_REPO_URL=https://github.com/your-org/your-repo
 ```
 
 Everything else has working defaults.
 
 ---
 
-## Step 2: Build and start the stack
+## Step 2: Build and start
 
-```bash
-cd paperclip/docker/workforce
+```powershell
 docker compose up --build -d
 ```
 
-First build takes 3–8 minutes (downloading base images, installing dependencies). Subsequent starts take ~15 seconds.
+First build takes 5–10 minutes (clones Paperclip source, pnpm install, pip installs hermes-agent from GitHub). Subsequent starts take ~15 seconds.
 
 Watch logs as it comes up:
 
-```bash
+```powershell
 docker compose logs -f
 ```
 
-You should see:
+Expected healthy state:
+
 ```
-paperclip     | Paperclip ready on http://0.0.0.0:3100
-hermes-worker | Hermes v0.10.x initialised — session: default-worker
-hermes-worker | Adapter polling Paperclip at http://paperclip:3100 every 30s
-mcp-server    | MCP server listening on 0.0.0.0:8765
+paperclip      | Server listening on 0.0.0.0:3100
+hermes-gateway | ✓ Smoke test passed
+hermes-gateway | ✓ Starting Hermes gateway (api_server on port 8642)...
+mcp-server     | MCP server running on 0.0.0.0:8765
 ```
 
 ---
 
-## Step 3: Open the interfaces
+## Step 3: Verify all services
 
-| Interface | URL | What it is |
-|-----------|-----|------------|
-| Paperclip UI | http://localhost:3100 | Company dashboard — org chart, tasks, budgets |
-| MCP server | http://localhost:8765 | Agent-to-agent API (no browser UI) |
-| Hermes logs | `docker compose logs hermes-worker -f` | Live agent output |
+```powershell
+# Check container status — all should show healthy
+docker compose ps
 
-Log in to Paperclip with `admin` and the password you set in `.env`.
+# Verify Hermes API server
+Invoke-RestMethod http://localhost:8642/health
+# Expected: {"status": "ok", "platform": "hermes-agent"}
 
----
+# Verify MCP server
+Invoke-RestMethod http://localhost:8765/health
 
-## Step 4: Run verification
-
-```bash
-docker compose exec mcp-server python /app/scripts/health_check.py
+# Check Paperclip UI
+# Open http://localhost:3100 in your browser
 ```
 
-All checks should pass. If any fail, see the **Troubleshooting** section below or read `references/windows.md` / `references/ubuntu.md` for platform-specific fixes.
+---
+
+## Step 4: Open the interfaces
+
+| Interface | URL | Notes |
+|-----------|-----|-------|
+| Paperclip UI | http://localhost:3100 | Login: admin + your PAPERCLIP_ADMIN_PASSWORD |
+| Hermes API | http://localhost:8642/v1 | OpenAI-compatible JSON API — no browser UI |
+| MCP server | http://localhost:8765 | Agent-to-agent tools — no browser UI |
+
+> Hermes has **no web UI**. The Paperclip UI at port 3100 is the control plane for managing agents and tasks. The Hermes gateway at port 8642 is a JSON API only.
 
 ---
 
-## Step 5: Initialise your first company
+## Step 5: First company setup
 
-In the Paperclip UI:
+In Paperclip:
 1. Click **New Company**
-2. Choose a template (Dev Shop, Research Lab, Content Studio, or blank)
-3. Set your company name and board goals
-4. The CEO agent will be auto-spawned — it maps to the `hermes-worker` container
+2. Choose a template or start blank
+3. Set company name and goals
+4. Create your first agent and assign it a task
 
-The adapter polls Paperclip every 30 seconds. When you assign the CEO their first task, you'll see Hermes pick it up in `docker compose logs hermes-worker -f`.
+When you assign a task, Paperclip's `hermes_local` adapter spawns a Hermes subprocess inside the Paperclip container to handle it.
+
+---
+
+## Key environment variables
+
+### Paperclip container
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `HERMES_YOLO_MODE` | **Bypass all dangerous-command approval prompts** — required for non-interactive agent runs | `1` |
+| `HERMES_ACCEPT_HOOKS` | Auto-approve shell tool hooks without TTY | `1` |
+| `AGENT_GIT_TOKEN` | GitHub PAT for Paperclip to clone private repo workspaces | — |
+| `HERMES_MODEL` | Override default model (e.g. `openrouter/anthropic/claude-3.5-sonnet`) | free Nemotron |
+
+### Hermes Gateway container
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `API_SERVER_ENABLED` | **Must be `true`** — env var enables the API server (gateway.yaml is ignored) | `true` |
+| `GATEWAY_ALLOW_ALL_USERS` | Needed only if not writing to `~/.hermes/.env` at startup | set by entrypoint |
+| `OPENROUTER_API_KEY` | Primary credential pool key | — |
+| `ANTHROPIC_API_KEY` | Secondary pool key | — |
+
+---
+
+## Credential pools
+
+The hermes-gateway supports same-provider key rotation. Add `_2`, `_3` variants in `.env`:
+
+```dotenv
+OPENROUTER_API_KEY=sk-or-abc...    # primary
+OPENROUTER_API_KEY_2=sk-or-def...  # rotated on 429/402
+OPENROUTER_API_KEY_3=sk-or-ghi...  # tertiary
+
+ANTHROPIC_API_KEY=sk-ant-abc...
+ANTHROPIC_API_KEY_2=sk-ant-def...
+```
+
+Pool rotation strategies (configured in `hermes/hermes-pool-config.yaml`):
+
+| Provider | Strategy | Reason |
+|----------|---------|--------|
+| OpenRouter | `round_robin` | Spread load evenly |
+| Anthropic | `least_used` | Protect quota |
+| OpenAI | `fill_first` | Use primary until exhausted |
+| Google | `round_robin` | Even rotation |
 
 ---
 
 ## Useful commands
 
-```bash
-# Start / stop the stack
+```powershell
+# Start / stop the full stack
 docker compose up -d
 docker compose down
 
-# Restart a single service
-docker compose restart hermes-worker
+# Restart a single service (no rebuild)
+docker compose restart paperclip
+docker compose restart hermes-gateway
 
 # View live logs
 docker compose logs -f
-docker compose logs paperclip -f --tail 50
+docker compose logs paperclip --tail 50
+docker compose logs hermes-gateway --tail 50
 
 # Open a shell inside a container
-docker compose exec hermes-worker bash
-docker compose exec paperclip sh
+docker compose exec paperclip bash
+docker compose exec hermes-gateway bash
 
-# Run hermes commands directly inside the container
-docker compose exec hermes-worker hermes --version
-docker compose exec hermes-worker hermes model
+# Check hermes inside Paperclip container
+docker compose exec paperclip hermes --version
+docker compose exec paperclip hermes auth list
 
-# Rebuild after a code change
-docker compose build hermes-worker
-docker compose up -d hermes-worker
+# Check API server health
+Invoke-RestMethod http://localhost:8642/health
+Invoke-RestMethod http://localhost:8642/v1/models
 
-# Full reset (keeps volumes — data is preserved)
-docker compose down && docker compose up -d
+# Rebuild after config changes
+docker compose build paperclip
+docker compose up -d paperclip
 
-# Nuclear reset (destroys all data — start fresh)
+# Full reset (keeps volumes — data preserved)
+docker compose down
+docker compose up -d
+
+# Nuclear reset (destroys all data)
 docker compose down -v
 ```
 
 ---
 
-## Persistent data
+## Troubleshooting
 
-All data is stored in named Docker volumes:
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `hermes` not found in PATH after pip install | `uv` puts binaries in non-standard location on node:trixie-slim | Skip uv entirely — use `pip3 install "git+https://github.com/NousResearch/hermes-agent.git" --break-system-packages` |
+| `hermes-agent` not on PyPI | Package not published to PyPI | Always install from GitHub: `git+https://github.com/NousResearch/hermes-agent.git` |
+| `EACCES: permission denied /paperclip/instances/default/.env` | Paperclip creates files as root then gosu-drops to node; root-owned files persist across restarts | Fixed by `wrapper-entrypoint.sh` which `chown -R node:node /paperclip` before official entrypoint |
+| `exec hermes gateway start` fails with "WSL detected but systemd not available" | `gateway start` tries systemd; use `gateway run` for foreground Docker use | Fix entrypoint to use `exec hermes gateway run` |
+| Hermes API server port 8642 not listening | API server is controlled by `API_SERVER_ENABLED=true` env var — the `gateway.yaml` file is **ignored** | Add `API_SERVER_ENABLED: "true"` to hermes-gateway environment in docker-compose.yml |
+| curl to port 8642 returns "connection closed" | Server is up but old container running without `API_SERVER_ENABLED` | Restart: `docker compose up -d hermes-gateway` |
+| Agent runs show `⚠️ DANGEROUS COMMAND` and auto-deny | Hermes security scanner auto-denies in non-interactive mode | Set `HERMES_YOLO_MODE: "1"` in Paperclip environment |
+| Git clone fails: "could not read Username" | Paperclip has no git credentials for private repo | Set `AGENT_GIT_TOKEN` in `.env` and `AGENT_REPO_URL`; wrapper-entrypoint.sh writes `/home/node/.git-credentials` |
+| `BETTER_AUTH_SECRET must be set` | Paperclip auth requires 32+ char secret | Set `BETTER_AUTH_SECRET=<32+ random chars>` in `.env` |
+| `GET /api/health 403` | Authenticated mode returns 403 on health endpoint | Healthcheck uses `wget -qO- ... >/dev/null 2>&1; exit 0` — always exits 0 |
+| `hermes chat -q` returns help text (wrong smoke test) | Correct syntax is `hermes -q "<prompt>"` not `hermes chat -q` | Fix entrypoint smoke test command |
+| `fallback_model should be a dict with 'provider' and 'model', got str` | Pool config format changed in newer Hermes | Use dict format: `fallback_model:\n  provider: openrouter\n  model: "nvidia/..."` |
+| PowerShell `&&` not valid | PowerShell doesn't support `&&` as command separator | Use `;` or separate commands |
+
+---
+
+## Persistent data
 
 | Volume | Contents |
 |--------|----------|
-| `paperclip-data` | Paperclip DB, org chart, tasks, goals, agent configs |
-| `hermes-sessions` | Hermes session state, agent memory, auto-created skills |
-| `hermes-skills` | Shared skills directory visible to all workers |
+| `paperclip-data` | Paperclip DB, org chart, tasks, goals, agent configs, Claude OAuth |
+| `hermes-sessions` | Hermes session state, agent memory |
+| `hermes-skills` | Shared skills visible to all workers |
 
 Volumes survive `docker compose down`. Only `docker compose down -v` removes them.
 
-**Backup:**
-```bash
-docker run --rm -v paperclip-data:/data -v $(pwd):/backup alpine \
-  tar czf /backup/paperclip-data-backup.tar.gz /data
+The `paperclip-data` volume is mounted read-only into `hermes-gateway` so both containers can share Claude Code OAuth credentials if authenticated.
 
-docker run --rm -v hermes-sessions:/data -v $(pwd):/backup alpine \
-  tar czf /backup/hermes-sessions-backup.tar.gz /data
+---
+
+## File layout
+
 ```
-
----
-
-## Scaling workers
-
-To run multiple Hermes workers (one per agent role), scale the service:
-
-```bash
-docker compose up -d --scale hermes-worker=3
+skills/hermes-paperclip-setup/docker/
+├── docker-compose.yml         # 3 services: paperclip, hermes-gateway, mcp-server
+├── .env.example               # copy to .env, fill in API keys
+├── paperclip/
+│   ├── Dockerfile             # clones Paperclip from GitHub, pnpm build, pip installs hermes-agent
+│   ├── wrapper-entrypoint.sh  # root PID 1: chowns /paperclip + configures git creds, then gosu
+│   └── hermes-init.sh         # runs as node user: writes ~/.hermes/config.json from env vars
+└── hermes/
+    ├── Dockerfile             # python:3.11-slim + uv + hermes-agent[all] from GitHub source
+    ├── entrypoint.sh          # seeds credential pools, writes GATEWAY_ALLOW_ALL_USERS, runs `hermes gateway run`
+    ├── hermes-config.json     # non-interactive config, all tools enabled
+    ├── hermes-gateway.yaml    # platform config (NOTE: ignored at runtime — use API_SERVER_ENABLED env var)
+    └── hermes-pool-config.yaml # pool rotation strategies, merged into config.yaml at startup
+└── mcp/
+    ├── Dockerfile
+    ├── requirements.txt
+    └── scripts/mcp_server.py  # FastMCP server exposing 7 agent-to-agent tools
 ```
-
-Or define named workers in `docker-compose.yml` (see `references/scaling.md` — create this when you're ready to build out a full org chart with dedicated containers per role).
-
----
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| `paperclip` exits immediately | Port 3100 in use | Change `PAPERCLIP_PORT` in `.env` |
-| `hermes-worker` can't reach Paperclip | Wrong internal URL | Internal URL is `http://paperclip:3100` — check `PAPERCLIP_API_URL` in `.env` |
-| Hermes fails with "model not configured" | No API key set | Add `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY` to `.env`, then `docker compose up -d` |
-| MCP server tools not reachable | Container not started or port blocked | Check `docker compose ps` and firewall rules for port 8765 |
-| Windows: volume mount errors | Docker Desktop not sharing drive | Settings → Resources → File Sharing → add the drive |
-| Ubuntu: permission denied on Docker socket | User not in docker group | `sudo usermod -aG docker $USER` then log out/in |
-| Adapter not picking up tasks | Heartbeat interval too long | Lower `ADAPTER_HEARTBEAT_INTERVAL` in `.env` (default 30s) |
-
-For platform-specific issues, read `references/windows.md` or `references/ubuntu.md`.
-
----
-
-## Reference files
-
-- `references/windows.md` — Docker Desktop install, WSL2 setup, path handling, volume tips
-- `references/ubuntu.md` — Docker Engine install, group permissions, systemd service, firewall
-- `docker/docker-compose.yml` — Full annotated compose file
-- `docker/hermes/Dockerfile` — Hermes worker image (Python 3.11 + Node 20 + adapter)
-- `docker/mcp/Dockerfile` — MCP server image

@@ -13,5 +13,16 @@
 # Fix ownership — silence errors if volume is empty or already correct
 chown -R node:node /paperclip 2>/dev/null || true
 
+# Configure git credentials for private repo access (runs as root, sets for node user)
+if [ -n "${AGENT_GIT_TOKEN:-}" ]; then
+    REPO_HOST=$(echo "${AGENT_REPO_URL:-github.com}" | sed 's|https://||' | cut -d/ -f1)
+    mkdir -p /home/node
+    echo "https://${AGENT_GIT_USER:-git}:${AGENT_GIT_TOKEN}@${REPO_HOST}" > /home/node/.git-credentials
+    git config --global credential.helper "store --file /home/node/.git-credentials"
+    git config --global user.name "${AGENT_GIT_USER:-ai-workforce-bot}"
+    git config --global user.email "agents@localhost"
+    chown node:node /home/node/.git-credentials 2>/dev/null || true
+fi
+
 # Hand off to Paperclip's official entrypoint (which does the real gosu)
 exec /app/scripts/docker-entrypoint.sh "$@"

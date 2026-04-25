@@ -81,6 +81,11 @@ services:
       PAPERCLIP_ADMIN_PASSWORD: "${PAPERCLIP_ADMIN_PASSWORD:-changeme}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:-ai-workforce-paperclip-secret-change-in-prod-32x}"
       HERMES_ACCEPT_HOOKS: "1"
+      HERMES_YOLO_MODE: "1"
+      # Git credentials — lets Paperclip clone private repos as agent workspace
+      AGENT_GIT_TOKEN:  "${AGENT_GIT_TOKEN:-}"
+      AGENT_GIT_USER:   "${AGENT_GIT_USER:-ai-workforce-bot}"
+      AGENT_REPO_URL:   "${AGENT_REPO_URL:-}"
     volumes:
       - paperclip-data:/paperclip
     networks:
