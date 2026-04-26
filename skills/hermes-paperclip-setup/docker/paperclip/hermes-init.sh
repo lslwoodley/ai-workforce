@@ -21,7 +21,7 @@ MODEL=""
 # 1. OpenRouter — best default: 200+ models, free tiers available
 if [ -n "$OPENROUTER_API_KEY" ] && [ "$OPENROUTER_API_KEY" != "sk-or-" ]; then
     PROVIDER="openrouter"
-    MODEL="${HERMES_MODEL:-openrouter/nvidia/nemotron-3-super-120b-a12b:free}"
+    MODEL="${HERMES_MODEL:-nvidia/nemotron-3-super-120b-a12b:free}"
     echo "[hermes-init] Provider: OpenRouter | Model: $MODEL"
 
 # 2. LM Studio — local Windows GPU, zero cost
@@ -58,7 +58,7 @@ elif [ -n "$GOOGLE_API_KEY" ]; then
 else
     echo "[hermes-init] WARNING: No model API key found — defaulting to free OpenRouter model."
     PROVIDER="openrouter"
-    MODEL="openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    MODEL="nvidia/nemotron-3-super-120b-a12b:free"
 fi
 
 # ── Step 2: Write primary configs ─────────────────────────────────────────────
