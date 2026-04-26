@@ -47,6 +47,16 @@ RUN apt-get update \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# hermes-wrapper: self-healing shim that intercepts --resume calls with
+# invalid/garbage session IDs and falls back to a fresh session automatically.
+# Prevents "Session not found: from" failures after adapter parse errors.
+COPY hermes-wrapper.py /usr/local/bin/hermes-wrapper.py
+RUN HERMES_BIN=$(which hermes) \
+ && mv "$HERMES_BIN" /usr/local/bin/hermes.real \
+ && printf '#!/bin/sh\nexec python3 /usr/local/bin/hermes-wrapper.py "$@"\n' \
+       > "$HERMES_BIN" \
+ && chmod +x "$HERMES_BIN" /usr/local/bin/hermes-wrapper.py
+
 # Hermes config initialiser — detects provider from env vars at startup
 COPY hermes-init.sh /usr/local/bin/hermes-init.sh
 RUN chmod +x /usr/local/bin/hermes-init.sh
