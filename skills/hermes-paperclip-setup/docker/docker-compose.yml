@@ -50,10 +50,16 @@ x-credentials: &credentials
   GOOGLE_API_KEY:       "${GOOGLE_API_KEY:-}"
   GOOGLE_API_KEY_2:     "${GOOGLE_API_KEY_2:-}"
   GOOGLE_MODEL:         "${GOOGLE_MODEL:-gemini-2.0-flash-lite}"
-  # Ollama — local LLMs, zero cost
+  # DeepSeek — cheap cloud reasoning (deepseek-reasoner / deepseek-chat)
+  DEEPSEEK_API_KEY:     "${DEEPSEEK_API_KEY:-}"
+  DEEPSEEK_MODEL:       "${DEEPSEEK_MODEL:-deepseek-reasoner}"
+  # LM Studio — local Windows GPU, zero cost, OpenAI-compatible (recommended fallback)
+  LM_STUDIO_BASE_URL:   "${LM_STUDIO_BASE_URL:-http://host.docker.internal:1235}"
+  LM_STUDIO_MODEL:      "${LM_STUDIO_MODEL:-}"
+  # Ollama — local LLMs, zero cost (alternative to LM Studio)
   OLLAMA_BASE_URL:      "${OLLAMA_BASE_URL:-}"
   OLLAMA_MODEL:         "${OLLAMA_MODEL:-llama3.2}"
-  # Default model
+  # Default model — overrides provider defaults
   HERMES_MODEL:         "${HERMES_MODEL:-openrouter/nvidia/nemotron-3-super-120b-a12b:free}"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -82,6 +88,9 @@ services:
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:-ai-workforce-paperclip-secret-change-in-prod-32x}"
       HERMES_ACCEPT_HOOKS: "1"
       HERMES_YOLO_MODE: "1"
+      # Grace period before hermes raises KeyboardInterrupt on SIGTERM (seconds).
+      # Set generously so an in-flight agent task can finish before being interrupted.
+      HERMES_SIGTERM_GRACE: "${HERMES_SIGTERM_GRACE:-3600}"
       # Git credentials — lets Paperclip clone private repos as agent workspace
       AGENT_GIT_TOKEN:  "${AGENT_GIT_TOKEN:-}"
       AGENT_GIT_USER:   "${AGENT_GIT_USER:-ai-workforce-bot}"
