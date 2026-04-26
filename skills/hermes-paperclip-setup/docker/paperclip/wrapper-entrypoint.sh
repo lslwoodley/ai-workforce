@@ -10,18 +10,35 @@
 #   This wrapper runs as root PID 1, fixes ownership, then hands off to the
 #   official entrypoint. It runs every time — idempotent, fast, ~0.1s overhead.
 
+# ── Clear stale embedded-PostgreSQL PID file ─────────────────────────────────
+# Paperclip's embedded Postgres writes a postmaster.pid to the data volume.
+# If the container was killed/restarted the old PID is dead but the file
+# persists in the named volume.  Paperclip then says "already running (pidN)"
+# and skips startup, leaving nothing listening on the port → ECONNREFUSED.
+# Removing the stale PID here (as root, before gosu-drop) lets Paperclip start
+# a fresh Postgres instance on every container boot.
+find /paperclip -name "postmaster.pid" -delete 2>/dev/null || true
+find /paperclip -name ".s.PGSQL.*" -delete 2>/dev/null || true
+
 # Fix ownership — silence errors if volume is empty or already correct
 chown -R node:node /paperclip 2>/dev/null || true
 
-# Configure git credentials for private repo access (runs as root, sets for node user)
+# Configure git credentials for private repo access
+# node user HOME=/paperclip (set in Dockerfile ENV), so write gitconfig there
 if [ -n "${AGENT_GIT_TOKEN:-}" ]; then
     REPO_HOST=$(echo "${AGENT_REPO_URL:-github.com}" | sed 's|https://||' | cut -d/ -f1)
-    mkdir -p /home/node
-    echo "https://${AGENT_GIT_USER:-git}:${AGENT_GIT_TOKEN}@${REPO_HOST}" > /home/node/.git-credentials
-    git config --global credential.helper "store --file /home/node/.git-credentials"
-    git config --global user.name "${AGENT_GIT_USER:-ai-workforce-bot}"
-    git config --global user.email "agents@localhost"
-    chown node:node /home/node/.git-credentials 2>/dev/null || true
+    mkdir -p /paperclip
+    # Credentials file — node user's HOME is /paperclip
+    echo "https://${AGENT_GIT_USER:-git}:${AGENT_GIT_TOKEN}@${REPO_HOST}" > /paperclip/.git-credentials
+    # Global gitconfig for the node user (HOME=/paperclip → /paperclip/.gitconfig)
+    cat > /paperclip/.gitconfig << GITCFG
+[credential]
+    helper = store --file /paperclip/.git-credentials
+[user]
+    name = ${AGENT_GIT_USER:-ai-workforce-bot}
+    email = agents@localhost
+GITCFG
+    chown node:node /paperclip/.git-credentials /paperclip/.gitconfig 2>/dev/null || true
 fi
 
 # Hand off to Paperclip's official entrypoint (which does the real gosu)
