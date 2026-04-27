@@ -86,10 +86,8 @@ services:
       PAPERCLIP_HOME: /paperclip
       PAPERCLIP_ADMIN_PASSWORD: "${PAPERCLIP_ADMIN_PASSWORD:-changeme}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:-ai-workforce-paperclip-secret-change-in-prod-32x}"
-      BETTER_AUTH_BASE_URL: "${BETTER_AUTH_BASE_URL:-http://localhost:3100}"
-      # Trusted origins — add your Tailscale IP so mobile auth works
-      BETTER_AUTH_TRUSTED_ORIGINS: "${BETTER_AUTH_TRUSTED_ORIGINS:-http://localhost:3100,http://100.64.159.57:3100}"
-      # Allowed hostnames written to config.json on every start (comma-separated)
+      # Allowed hostnames — native Paperclip env var, no config.json needed.
+      # Add your Tailscale IP (just the IP, no protocol or port).
       PAPERCLIP_ALLOWED_HOSTNAMES: "${PAPERCLIP_ALLOWED_HOSTNAMES:-100.64.159.57}"
       HERMES_ACCEPT_HOOKS: "1"
       HERMES_YOLO_MODE: "1"
