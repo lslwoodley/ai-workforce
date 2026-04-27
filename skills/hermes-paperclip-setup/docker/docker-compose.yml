@@ -89,6 +89,8 @@ services:
       BETTER_AUTH_BASE_URL: "${BETTER_AUTH_BASE_URL:-http://localhost:3100}"
       # Trusted origins — add your Tailscale IP so mobile auth works
       BETTER_AUTH_TRUSTED_ORIGINS: "${BETTER_AUTH_TRUSTED_ORIGINS:-http://localhost:3100,http://100.64.159.57:3100}"
+      # Allowed hostnames written to config.json on every start (comma-separated)
+      PAPERCLIP_ALLOWED_HOSTNAMES: "${PAPERCLIP_ALLOWED_HOSTNAMES:-100.64.159.57}"
       HERMES_ACCEPT_HOOKS: "1"
       HERMES_YOLO_MODE: "1"
       # Grace period before hermes raises KeyboardInterrupt on SIGTERM (seconds).
